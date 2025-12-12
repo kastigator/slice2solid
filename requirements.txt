@@ -1,0 +1,7 @@
+Set-Content requirements.txt @"
+numpy
+scipy
+trimesh
+shapely
+rtree
+"@
