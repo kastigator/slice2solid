@@ -132,24 +132,45 @@ def estimate_bead_width_mm(
 ) -> float | None:
     """
     Estimates bead width (mm) from Insight params.
-    Prefers contourWidth when available.
+    Uses the largest plausible bead width among common keys (including custom infill groups),
+    because under-estimating radius can create gaps in voxelization.
     """
     slice_h_params = _parse_float(params.slice_params.get("sliceHeight"))
     k = infer_params_length_scale(params_slice_height=slice_h_params, sim_slice_height_mm=sim_slice_height_mm) or 25.4
 
     tp = params.toolpath_params
-    candidates = [
+    widths_in_params: list[float] = []
+
+    # Common/global widths (not all will be present for all printers/modes).
+    common_keys = (
         "contourWidth",
+        "openCurveWidth",
+        "perimeterWidth",
+        "rasterWidth",
+        "sparseRasterWidth",
         "main:base:width",
         "alt:base:width",
         "main:base:topWidth",
         "alt:base:topWidth",
         "main:part:prefContourWidth",
         "alt:part:prefContourWidth",
-    ]
-    for key in candidates:
+    )
+    for key in common_keys:
         w = _parse_float(tp.get(key))
-        if w is None:
+        if w is not None and w > 0:
+            widths_in_params.append(w)
+
+    # Custom group widths (e.g. when using custom infill groups in Insight).
+    # Keys typically look like: custom:1:rasterWidth, custom:1:sparseRasterWidth, custom:1:prefContourWidth, etc.
+    custom_width_re = re.compile(r"^custom:\d+:(?:prefContourWidth|openCurveWidth|rasterWidth|sparseRasterWidth)$")
+    for key, value in tp.items():
+        if not custom_width_re.match(key):
             continue
-        return w * k
-    return None
+        w = _parse_float(value)
+        if w is not None and w > 0:
+            widths_in_params.append(w)
+
+    if not widths_in_params:
+        return None
+
+    return max(widths_in_params) * k
