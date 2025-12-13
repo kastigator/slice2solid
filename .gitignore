@@ -32,6 +32,10 @@ MANIFEST
 *.manifest
 *.spec
 
+# PyInstaller build outputs (project-specific)
+build_exe/
+dist_exe/
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
