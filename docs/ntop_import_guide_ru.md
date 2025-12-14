@@ -1,18 +1,18 @@
 # Импорт результата slice2solid в nTop (гладкий STEP)
 
-Цель: из сетки `preview_structure.stl` получить в nTop гладкое твердое тело и экспортировать `STEP`.
+Цель: из сетки `*_s2s_preview_structure.stl` получить в nTop гладкое твердое тело и экспортировать `STEP`.
 
 ## Что даёт slice2solid
 
 В папке результата (Output folder) обычно есть:
-- `preview_structure.stl` — сетка восстановленной структуры.
-- `metadata.json` — параметры запуска, матрица, статистика, `voxel_size_mm`.
-- (Опционально) `preview_structure.ply`, `ntop_points.csv` и `ntop_recipe.txt` — “bundle” для nTop (альтернативный импорт + point cloud + подсказки).
+- `*_s2s_preview_structure.stl` — сетка восстановленной структуры (имя включает параметры, например `..._vox0p25_ds4_sig1_it20_...`).
+- `metadata.json` — параметры запуска, матрица, статистика, `voxel_size_mm` (и доп. сведения о mesh, если включён экспорт геометрии).
+- (Опционально) `*_s2s_preview_structure.ply`, `ntop_points.csv` и `ntop_recipe.txt` — “bundle” для nTop (альтернативный импорт + point cloud + подсказки).
 
 ## Типовой пайплайн в nTop (для решёток/заполнений)
 
 1) `Utilities` → `Import Mesh`
-- File: `preview_structure.stl` (или `preview_structure.ply`)
+- File: `*_s2s_preview_structure.stl` (или `*_s2s_preview_structure.ply`)
 - Units: `mm`
 
 2) Поиск (Ctrl+F) и добавить блок: `Implicit Body from Mesh`
@@ -43,7 +43,10 @@
 
 Ориентир от slice2solid:
 - В `metadata.json` есть `voxel.voxel_size_mm`.
-- Стартовое значение для nTop: примерно `0.5 * voxel_size_mm`.
+- Если включён downsample для meshing (в имени есть `dsN`), эффективный шаг сетки ≈ `voxel_size_mm * N`.
+- Стартовое значение для nTop:
+  - по точкам/вокселям: примерно `0.5 * voxel_size_mm`
+  - по mesh: примерно `0.5 * voxel_size_mm * N` (если `dsN > 1`)
   - Если тяжело по памяти/времени: увеличивайте spacing.
   - Если теряются тонкие элементы: уменьшайте spacing.
 

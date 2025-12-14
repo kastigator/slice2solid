@@ -13,6 +13,18 @@ import numpy as np
 import trimesh
 from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 
+try:  # optional: 3D preview
+    import pyqtgraph.opengl as gl
+except Exception:  # pragma: no cover
+    gl = None
+
+try:  # optional: high-quality 3D preview (VTK)
+    import pyvista as pv
+    from pyvistaqt import QtInteractor
+except Exception:  # pragma: no cover
+    pv = None
+    QtInteractor = None
+
 from slice2solid.core.insight_simulation import (
     invert_rowvec_matrix,
     read_simulation_export,
@@ -37,6 +49,7 @@ class JobConfig:
     min_component_voxels: int
     min_mesh_component_faces: int
     volume_smooth_sigma_vox: float
+    meshing_downsample_factor: int
     smooth_iterations: int
     export_cae_layers: bool
     export_geometry_preview: bool
@@ -50,6 +63,7 @@ class JobConfig:
 class Worker(QtCore.QObject):
     progress = QtCore.Signal(int)
     log = QtCore.Signal(str)
+    meshes_ready = QtCore.Signal(object, object, object)
     finished = QtCore.Signal(bool, str, object)
 
     def __init__(self, cfg: JobConfig):
@@ -191,10 +205,66 @@ class Worker(QtCore.QObject):
                     vox,
                     volume_smooth_sigma_vox=self.cfg.volume_smooth_sigma_vox,
                     min_component_faces=self.cfg.min_mesh_component_faces,
+                    downsample_factor=int(self.cfg.meshing_downsample_factor)
+                    if int(self.cfg.meshing_downsample_factor) > 1
+                    else None,
                 )
+                try:
+                    ds = int(preview_mesh.metadata.get("meshing_downsample_factor", 1))
+                    eff = float(preview_mesh.metadata.get("meshing_voxel_size_mm", float(self.cfg.voxel_size_mm)))
+                    if ds > 1:
+                        self.log.emit(f"Meshing downsample: x{ds} (effective voxel {eff:.3f} mm)")
+                except Exception:
+                    pass
+                mesh_before = preview_mesh.copy()
                 if self.cfg.smooth_iterations > 0:
                     self.log.emit(f"Сглаживание сетки ({self.cfg.smooth_iterations} итераций)…")
                     trimesh.smoothing.filter_laplacian(preview_mesh, iterations=int(self.cfg.smooth_iterations))
+                mesh_after = preview_mesh
+                try:
+                    target_preview_faces = 600_000
+
+                    def _build_display_mesh(base_mesh: trimesh.Trimesh, *, post_smooth: bool) -> tuple[trimesh.Trimesh, int]:
+                        if base_mesh.faces is not None and len(base_mesh.faces) <= target_preview_faces:
+                            return base_mesh, int(base_mesh.metadata.get("meshing_downsample_factor", 1) or 1)
+                        if vox is None:
+                            return base_mesh, int(base_mesh.metadata.get("meshing_downsample_factor", 1) or 1)
+                        base_ds = max(1, int(self.cfg.meshing_downsample_factor))
+                        faces_count = int(len(base_mesh.faces)) if base_mesh.faces is not None else target_preview_faces + 1
+                        ratio = max(1.0, faces_count / float(target_preview_faces))
+                        mul = int(math.ceil(math.sqrt(ratio)))
+                        mul_pow2 = 1 << int(max(0, mul - 1)).bit_length()
+                        ds = min(64, base_ds * mul_pow2)
+                        display = mesh_from_voxels_configured(
+                            vox,
+                            volume_smooth_sigma_vox=self.cfg.volume_smooth_sigma_vox,
+                            min_component_faces=self.cfg.min_mesh_component_faces,
+                            downsample_factor=int(ds) if int(ds) > 1 else None,
+                        )
+                        if post_smooth and int(self.cfg.smooth_iterations) > 0:
+                            trimesh.smoothing.filter_laplacian(display, iterations=int(self.cfg.smooth_iterations))
+                        return display, int(ds)
+
+                    disp_before, disp_ds_before = _build_display_mesh(mesh_before, post_smooth=False)
+                    disp_after, disp_ds_after = _build_display_mesh(mesh_after, post_smooth=True)
+
+                    stats = {
+                        "before": {"vertices": int(mesh_before.vertices.shape[0]), "faces": int(mesh_before.faces.shape[0])},
+                        "after": {"vertices": int(mesh_after.vertices.shape[0]), "faces": int(mesh_after.faces.shape[0])},
+                        "display_before": {
+                            "vertices": int(disp_before.vertices.shape[0]),
+                            "faces": int(disp_before.faces.shape[0]),
+                            "ds": int(disp_ds_before),
+                        },
+                        "display_after": {
+                            "vertices": int(disp_after.vertices.shape[0]),
+                            "faces": int(disp_after.faces.shape[0]),
+                            "ds": int(disp_ds_after),
+                        },
+                    }
+                    self.meshes_ready.emit(disp_before, disp_after, stats)
+                except Exception:
+                    pass
                 self.progress.emit(85)
 
             out_dir = Path(self.cfg.output_dir)
@@ -296,6 +366,7 @@ class Worker(QtCore.QObject):
                 "simulation_header": sim_header.raw,
                 "stl_to_cmb_matrix": sim_header.stl_to_cmb.tolist(),
                 "outputs": outputs,
+                "mesh": None,
                 "voxel": None,
                 "stats": {
                     "rows_total": total,
@@ -310,6 +381,19 @@ class Worker(QtCore.QObject):
                     "shape": list(vox.shape),
                     "occupied_voxels": int(vox.occupied.sum()),
                 }
+            if self.cfg.export_geometry_preview and preview_mesh is not None:
+                try:
+                    meta["mesh"] = {
+                        "vertices": int(preview_mesh.vertices.shape[0]),
+                        "faces": int(preview_mesh.faces.shape[0]),
+                        "meshing_downsample_factor": int(preview_mesh.metadata.get("meshing_downsample_factor", 1)),
+                        "meshing_voxel_size_mm": float(
+                            preview_mesh.metadata.get("meshing_voxel_size_mm", float(self.cfg.voxel_size_mm))
+                        ),
+                        "estimated_binary_stl_size_bytes": int(84 + 50 * int(preview_mesh.faces.shape[0])),
+                    }
+                except Exception:
+                    meta["mesh"] = None
             out_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             outputs.append(str(out_json))
 
@@ -689,13 +773,18 @@ def _preview_mesh_stem(cfg: JobConfig) -> str:
     part = _safe_filename_stem(Path(cfg.placed_stl).stem)
     vox = _format_token(cfg.voxel_size_mm, decimals=3)
     sig = _format_token(cfg.volume_smooth_sigma_vox, decimals=3)
+    ds = int(getattr(cfg, "meshing_downsample_factor", 1) or 1)
     it = int(cfg.smooth_iterations)
-    return f"{part}_vox{vox}_sig{sig}_it{it}_s2s_preview_structure"
+    ds_part = f"_ds{ds}" if ds > 1 else ""
+    return f"{part}_vox{vox}{ds_part}_sig{sig}_it{it}_s2s_preview_structure"
 
 
 def _render_ntop_recipe(cfg: JobConfig) -> str:
     v = float(cfg.voxel_size_mm)
     suggested = max(0.5 * v, 0.02)
+    ds = int(getattr(cfg, "meshing_downsample_factor", 1) or 1)
+    v_mesh = v * float(ds)
+    suggested_mesh = max(0.5 * v_mesh, 0.02)
     preview_stem = _preview_mesh_stem(cfg)
     return (
         "slice2solid → nTop: рекомендуемый workflow\n"
@@ -718,13 +807,465 @@ def _render_ntop_recipe(cfg: JobConfig) -> str:
         "\n"
         "Стартовые параметры (подсказка):\n"
         f" - slice2solid voxel_size_mm = {v:.3f}\n"
-        f" - nTop implicit resolution/spacing: ~{suggested:.3f} mm (≈ 0.5 * voxel_size)\n"
+        f" - mesh effective voxel (after meshing downsample): {v_mesh:.3f} mm (ds={ds})\n"
+        f" - nTop implicit spacing (from voxels/point-cloud): ~{suggested:.3f} mm (≈ 0.5 * voxel_size)\n"
+        f" - nTop implicit spacing (from mesh): ~{suggested_mesh:.3f} mm (≈ 0.5 * mesh effective voxel)\n"
         "   Если слишком медленно: увеличьте spacing. Если теряются детали: уменьшите spacing.\n"
     )
 
 
+def _render_wireframe_preview(
+    mesh: trimesh.Trimesh,
+    *,
+    width: int,
+    height: int,
+    max_edges: int = 200_000,
+    fg: QtGui.QColor,
+    bg: QtGui.QColor,
+) -> QtGui.QImage:
+    img = QtGui.QImage(max(1, int(width)), max(1, int(height)), QtGui.QImage.Format.Format_ARGB32)
+    img.fill(bg)
+
+    if mesh.faces is None or mesh.vertices is None:
+        return img
+    if len(mesh.faces) == 0 or len(mesh.vertices) == 0:
+        return img
+
+    verts = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+
+    forward = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    forward = forward / (np.linalg.norm(forward) + 1e-12)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    if abs(float(np.dot(forward, up))) > 0.95:
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    right = np.cross(up, forward)
+    right = right / (np.linalg.norm(right) + 1e-12)
+    up2 = np.cross(forward, right)
+    up2 = up2 / (np.linalg.norm(up2) + 1e-12)
+
+    basis = np.stack([right, up2], axis=1)  # (3,2)
+    proj = verts @ basis  # (N,2)
+
+    pmin = proj.min(axis=0)
+    pmax = proj.max(axis=0)
+    span = np.maximum(pmax - pmin, 1e-6)
+
+    pad = 12.0
+    sx = (float(width) - 2.0 * pad) / float(span[0])
+    sy = (float(height) - 2.0 * pad) / float(span[1])
+    scale = float(min(sx, sy))
+    xy = (proj - pmin[None, :]) * scale + pad
+    xy[:, 1] = float(height) - xy[:, 1]
+
+    edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    edges.sort(axis=1)
+    try:
+        edges = np.unique(edges, axis=0)
+    except Exception:
+        pass
+    if max_edges > 0 and edges.shape[0] > int(max_edges):
+        idx = np.linspace(0, edges.shape[0] - 1, num=int(max_edges), dtype=int)
+        edges = edges[idx]
+
+    painter = QtGui.QPainter(img)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+    pen = QtGui.QPen(fg)
+    pen.setWidthF(1.0)
+    painter.setPen(pen)
+
+    path = QtGui.QPainterPath()
+    pts = xy[edges.reshape(-1)].reshape((-1, 2, 2))
+    for a, b in pts:
+        path.moveTo(float(a[0]), float(a[1]))
+        path.lineTo(float(b[0]), float(b[1]))
+    painter.drawPath(path)
+    painter.end()
+    return img
+
+
+class _Mesh2DView(QtWidgets.QWidget):
+    def __init__(self, *, title: str):
+        super().__init__()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._title = QtWidgets.QLabel(title)
+        self._title.setStyleSheet("font-weight: 600;")
+        self._stats = QtWidgets.QLabel("")
+        self._stats.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        header = QtWidgets.QWidget()
+        header_layout = QtWidgets.QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 6, 8, 6)
+        header_layout.addWidget(self._title, 0)
+        header_layout.addStretch(1)
+        header_layout.addWidget(self._stats, 0)
+        layout.addWidget(header, 0)
+
+        self._image = QtWidgets.QLabel("")
+        self._image.setMinimumHeight(200)
+        self._image.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._image.setStyleSheet("background-color: #111317; border: 1px solid #2B2F36;")
+        layout.addWidget(self._image, 1)
+
+    def set_mesh(self, mesh: trimesh.Trimesh | None, *, stats_text: str = "", color: str = "#6BCB77") -> None:
+        self._stats.setText(stats_text)
+        if mesh is None or mesh.faces is None or mesh.vertices is None or len(mesh.faces) == 0:
+            self._image.setText("Нет сетки для отображения")
+            self._image.setPixmap(QtGui.QPixmap())
+            return
+
+        w = max(320, int(self._image.width()))
+        h = max(240, int(self._image.height()))
+        img = _render_wireframe_preview(
+            mesh,
+            width=w,
+            height=h,
+            fg=QtGui.QColor(color),
+            bg=QtGui.QColor("#111317"),
+        )
+        self._image.setText("")
+        self._image.setPixmap(QtGui.QPixmap.fromImage(img))
+
+
+class _Mesh3DView(QtWidgets.QWidget):
+    def __init__(self, *, title: str):
+        super().__init__()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._title = QtWidgets.QLabel(title)
+        self._title.setStyleSheet("font-weight: 600;")
+        self._stats = QtWidgets.QLabel("")
+        self._stats.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        header = QtWidgets.QWidget()
+        header_layout = QtWidgets.QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 6, 8, 6)
+        header_layout.addWidget(self._title, 0)
+        header_layout.addStretch(1)
+        header_layout.addWidget(self._stats, 0)
+        layout.addWidget(header, 0)
+
+        toolbar = QtWidgets.QWidget()
+        toolbar_layout = QtWidgets.QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(8, 0, 8, 6)
+        self._faces_cb = QtWidgets.QCheckBox("Поверхность")
+        self._faces_cb.setChecked(True)
+        self._edges_cb = QtWidgets.QCheckBox("Рёбра")
+        self._edges_cb.setChecked(True)
+        self._auto_fit_btn = QtWidgets.QPushButton("Fit")
+        self._auto_fit_btn.setToolTip("Подогнать камеру под модель")
+        self._hint = QtWidgets.QLabel("ЛКМ: вращение · колесо: зум · ПКМ: панорама")
+        self._hint.setStyleSheet("color: #6B7280;")
+        toolbar_layout.addWidget(self._faces_cb, 0)
+        toolbar_layout.addWidget(self._edges_cb, 0)
+        toolbar_layout.addSpacing(8)
+        toolbar_layout.addWidget(self._auto_fit_btn, 0)
+        toolbar_layout.addStretch(1)
+        toolbar_layout.addWidget(self._hint, 0)
+        layout.addWidget(toolbar, 0)
+
+        self._gl = gl.GLViewWidget()
+        self._gl.setBackgroundColor("#111317")
+        layout.addWidget(self._gl, 1)
+        self._mesh_item: object | None = None
+        self._edges_item: object | None = None
+        self._radius: float = 1.0
+
+        self._axis = gl.GLAxisItem()
+        self._axis.setSize(10, 10, 10)
+        self._gl.addItem(self._axis)
+
+        self._grid = gl.GLGridItem()
+        self._grid.setSize(50, 50)
+        self._grid.setSpacing(10, 10)
+        self._grid.translate(0, 0, 0)
+        self._gl.addItem(self._grid)
+
+        self._faces_cb.toggled.connect(self._apply_visibility)
+        self._edges_cb.toggled.connect(self._apply_visibility)
+        self._auto_fit_btn.clicked.connect(self._fit_camera)
+
+    def _fit_camera(self) -> None:
+        r = float(self._radius or 1.0)
+        try:
+            self._gl.setCameraPosition(distance=max(10.0, 2.6 * r), elevation=25, azimuth=-45)
+        except Exception:
+            self._gl.opts["distance"] = max(10.0, 2.6 * r)
+            self._gl.opts["elevation"] = 25
+            self._gl.opts["azimuth"] = -45
+
+    def _apply_visibility(self) -> None:
+        if self._mesh_item is not None:
+            try:
+                self._mesh_item.setVisible(bool(self._faces_cb.isChecked()))
+            except Exception:
+                pass
+        if self._edges_item is not None:
+            try:
+                self._edges_item.setVisible(bool(self._edges_cb.isChecked()))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _unique_edges(faces: np.ndarray, *, max_edges: int) -> np.ndarray:
+        edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]).astype(np.int64, copy=False)
+        edges.sort(axis=1)
+        try:
+            edges = np.unique(edges, axis=0)
+        except Exception:
+            pass
+        if max_edges > 0 and edges.shape[0] > int(max_edges):
+            idx = np.linspace(0, edges.shape[0] - 1, num=int(max_edges), dtype=int)
+            edges = edges[idx]
+        return edges
+
+    def set_mesh(self, mesh: trimesh.Trimesh | None, *, stats_text: str = "", color: str = "#6BCB77") -> None:
+        self._stats.setText(stats_text)
+        if self._mesh_item is not None:
+            try:
+                self._gl.removeItem(self._mesh_item)
+            except Exception:
+                pass
+            self._mesh_item = None
+        if self._edges_item is not None:
+            try:
+                self._gl.removeItem(self._edges_item)
+            except Exception:
+                pass
+            self._edges_item = None
+
+        if mesh is None or mesh.faces is None or mesh.vertices is None or len(mesh.faces) == 0:
+            return
+
+        verts = np.asarray(mesh.vertices, dtype=np.float32)
+        faces = np.asarray(mesh.faces, dtype=np.int32)
+        if verts.size == 0 or faces.size == 0:
+            return
+
+        try:
+            bounds = np.asarray(mesh.bounds, dtype=np.float32)
+            center = bounds.mean(axis=0)
+            verts = verts - center[None, :]
+            ext = bounds[1] - bounds[0]
+            radius = float(np.linalg.norm(ext) * 0.6 + 1e-6)
+        except Exception:
+            radius = 1.0
+        self._radius = float(radius)
+
+        meshdata = gl.MeshData(vertexes=verts, faces=faces)
+        try:
+            meshdata.vertexNormals()
+        except Exception:
+            pass
+        item = gl.GLMeshItem(
+            meshdata=meshdata,
+            smooth=True,
+            shader="shaded",
+            color=QtGui.QColor(color).getRgbF(),
+            drawFaces=True,
+            drawEdges=False,
+        )
+        try:
+            item.setGLOptions("opaque")
+        except Exception:
+            pass
+        self._gl.addItem(item)
+        self._mesh_item = item
+
+        # Wireframe overlay (brighter than GLMeshItem edges and easier to read).
+        try:
+            edges = self._unique_edges(faces, max_edges=200_000)
+            seg = verts[edges.reshape(-1)].reshape((-1, 3))
+            edges_item = gl.GLLinePlotItem(pos=seg, mode="lines", color=(1.0, 1.0, 1.0, 0.22), width=1, antialias=True)
+            edges_item.setGLOptions("translucent")
+            self._gl.addItem(edges_item)
+            self._edges_item = edges_item
+        except Exception:
+            self._edges_item = None
+
+        # Fit helpers.
+        grid_size = max(20.0, 3.0 * float(radius))
+        try:
+            self._axis.setSize(grid_size * 0.6, grid_size * 0.6, grid_size * 0.6)
+            self._grid.setSize(grid_size, grid_size)
+            step = max(1.0, grid_size / 10.0)
+            self._grid.setSpacing(step, step)
+        except Exception:
+            pass
+
+        self._fit_camera()
+        self._apply_visibility()
+
+
+class _MeshVTKView(QtWidgets.QWidget):
+    def __init__(self, *, title: str):
+        super().__init__()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._title = QtWidgets.QLabel(title)
+        self._title.setStyleSheet("font-weight: 600;")
+        self._stats = QtWidgets.QLabel("")
+        self._stats.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        header = QtWidgets.QWidget()
+        header_layout = QtWidgets.QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 6, 8, 6)
+        header_layout.addWidget(self._title, 0)
+        header_layout.addStretch(1)
+        header_layout.addWidget(self._stats, 0)
+        layout.addWidget(header, 0)
+
+        toolbar = QtWidgets.QWidget()
+        toolbar_layout = QtWidgets.QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(8, 0, 8, 6)
+        self._edges_cb = QtWidgets.QCheckBox("Рёбра")
+        self._edges_cb.setChecked(True)
+        self._clip_cb = QtWidgets.QCheckBox("Сечение")
+        self._clip_cb.setChecked(False)
+        self._clip_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self._clip_slider.setRange(0, 1000)
+        self._clip_slider.setValue(500)
+        self._clip_slider.setEnabled(False)
+        self._clip_slider.setToolTip("Плоскость сечения вдоль Z (для осмотра внутренности)")
+        self._fit_btn = QtWidgets.QPushButton("Fit")
+        self._fit_btn.setToolTip("Подогнать камеру под модель")
+        hint = QtWidgets.QLabel("ЛКМ: вращение · колесо: зум · ПКМ: панорама")
+        hint.setStyleSheet("color: #6B7280;")
+        toolbar_layout.addWidget(self._edges_cb, 0)
+        toolbar_layout.addSpacing(8)
+        toolbar_layout.addWidget(self._clip_cb, 0)
+        toolbar_layout.addWidget(self._clip_slider, 1)
+        toolbar_layout.addSpacing(8)
+        toolbar_layout.addWidget(self._fit_btn, 0)
+        toolbar_layout.addStretch(1)
+        toolbar_layout.addWidget(hint, 0)
+        layout.addWidget(toolbar, 0)
+
+        self._plot = QtInteractor(self)
+        self._plot.set_background("#111317")
+        layout.addWidget(self._plot.interactor, 1)
+
+        self._poly: pv.PolyData | None = None
+        self._actor = None
+        self._bounds: np.ndarray | None = None
+
+        self._edges_cb.toggled.connect(self._update_render)
+        self._clip_cb.toggled.connect(self._toggle_clip)
+        self._clip_slider.valueChanged.connect(self._update_render)
+        self._fit_btn.clicked.connect(self._fit_camera)
+
+    def _toggle_clip(self, on: bool) -> None:
+        self._clip_slider.setEnabled(bool(on))
+        self._update_render()
+
+    @staticmethod
+    def _to_poly(mesh: trimesh.Trimesh) -> pv.PolyData:
+        verts = np.asarray(mesh.vertices, dtype=np.float32)
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        if verts.size == 0 or faces.size == 0:
+            return pv.PolyData()
+        faces_vtk = np.hstack([np.full((faces.shape[0], 1), 3, dtype=np.int64), faces]).ravel()
+        poly = pv.PolyData(verts, faces_vtk)
+        poly.clean(inplace=True)
+        return poly
+
+    def _fit_camera(self) -> None:
+        try:
+            self._plot.reset_camera()
+        except Exception:
+            pass
+
+    def set_mesh(self, mesh: trimesh.Trimesh | None, *, stats_text: str = "", color: str = "#6BCB77") -> None:
+        self._stats.setText(stats_text)
+        self._plot.clear()
+        self._poly = None
+        self._bounds = None
+        if mesh is None or mesh.faces is None or mesh.vertices is None or len(mesh.faces) == 0:
+            self._plot.render()
+            return
+        poly = self._to_poly(mesh)
+        self._poly = poly
+        try:
+            self._bounds = np.array(poly.bounds, dtype=float)
+        except Exception:
+            self._bounds = None
+        self._color = color
+        self._update_render()
+        self._fit_camera()
+
+    def _update_render(self) -> None:
+        if self._poly is None:
+            return
+        poly = self._poly
+        if self._clip_cb.isChecked() and self._bounds is not None:
+            z0, z1 = float(self._bounds[4]), float(self._bounds[5])
+            t = float(self._clip_slider.value()) / 1000.0
+            z = z0 + t * (z1 - z0)
+            try:
+                poly = poly.clip(normal=(0, 0, 1), origin=(0, 0, z), invert=False)
+            except Exception:
+                poly = self._poly
+
+        self._plot.clear()
+        self._plot.add_mesh(
+            poly,
+            color=self._color,
+            smooth_shading=True,
+            show_edges=bool(self._edges_cb.isChecked()),
+            edge_color="#2B2F36",
+            ambient=0.2,
+            diffuse=0.8,
+            specular=0.15,
+            specular_power=20.0,
+        )
+        self._plot.show_axes()
+        self._plot.render()
+
+
+class MeshCompareWidget(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        if pv is not None and QtInteractor is not None:
+            view_cls = _MeshVTKView
+        elif gl is not None:
+            view_cls = _Mesh3DView
+        else:
+            view_cls = _Mesh2DView
+        self.before = view_cls(title="До (после marching cubes)")
+        self.after = view_cls(title="После (после сглаживания)")
+        layout.addWidget(self.before, 1)
+        layout.addWidget(self.after, 1)
+
+    @staticmethod
+    def _fmt_stats(stats: dict, key: str) -> str:
+        try:
+            v = int(stats[key]["vertices"])
+            f = int(stats[key]["faces"])
+            est = 84 + 50 * f
+            mb = est / (1024.0 * 1024.0)
+            extra = ""
+            dkey = "display_" + key
+            if isinstance(stats.get(dkey), dict):
+                pv = int(stats[dkey].get("vertices", 0) or 0)
+                pf = int(stats[dkey].get("faces", 0) or 0)
+                ds = int(stats[dkey].get("ds", 1) or 1)
+                if pv and pf:
+                    extra = f"  (preview: V={pv:,} F={pf:,} ds={ds})"
+            return f"V={v:,}  F={f:,}  ~{mb:.1f} MiB STL{extra}"
+        except Exception:
+            return ""
+
+    def set_meshes(self, before: trimesh.Trimesh | None, after: trimesh.Trimesh | None, stats: dict | None = None) -> None:
+        stats = stats or {}
+        self.before.set_mesh(before, stats_text=self._fmt_stats(stats, "before"), color="#4D96FF")
+        self.after.set_mesh(after, stats_text=self._fmt_stats(stats, "after"), color="#6BCB77")
+
+
 _HELP_HTML = """
-<h2>slice2solid — Справка</h2>
+<h2>slice2solid - Справка</h2>
 
 <p><b>Подсказки в интерфейсе:</b> наведите курсор на параметр, чтобы увидеть tooltip. Также можно нажать <b>Shift+F1</b> и кликнуть по элементу, чтобы открыть “What’s This?”.</p>
 
@@ -1098,6 +1639,19 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         geo_form.addRow("Сглаживание объёма (sigma, vox):", self.vol_sigma)
 
+        self.meshing_downsample = QtWidgets.QSpinBox()
+        self.meshing_downsample.setRange(1, 64)
+        self.meshing_downsample.setValue(1)
+        _set_help(
+            self.meshing_downsample,
+            title="Downsample для meshing (factor)",
+            body="Упрощает сетку ещё на этапе marching cubes: строит поверхность по разреженному объёму (каждый N-й воксель).",
+            pros="Очень сильно уменьшает размер STL и ускоряет meshing (примерно ~N² по числу граней).",
+            cons="Тонкие элементы могут исчезнуть; поверхность станет грубее.",
+            tip="Начните с 2 или 4. Если детали теряются — уменьшайте. Если STL слишком большой — увеличивайте.",
+        )
+        geo_form.addRow("Downsample для meshing:", self.meshing_downsample)
+
         self.smooth = QtWidgets.QSpinBox()
         self.smooth.setRange(0, 200)
         self.smooth.setValue(0)
@@ -1112,6 +1666,20 @@ class MainWindow(QtWidgets.QMainWindow):
         geo_form.addRow("Сглаживание сетки (итерации):", self.smooth)
 
         geo_layout.addStretch(1)
+
+        # --- Tab: Preview ---
+        preview_tab = QtWidgets.QWidget()
+        tabs.addTab(preview_tab, "Просмотр")
+        prev_layout = QtWidgets.QVBoxLayout(preview_tab)
+        prev_hint = QtWidgets.QLabel(
+            "Просмотр результата последнего запуска.\n"
+            "Слева: сетка сразу после marching cubes. Справа: после сглаживания.\n"
+            "Если сетка слишком большая, для предпросмотра она автоматически прореживается."
+        )
+        prev_hint.setWordWrap(True)
+        prev_layout.addWidget(prev_hint, 0)
+        self.mesh_preview = MeshCompareWidget()
+        prev_layout.addWidget(self.mesh_preview, 1)
 
         # --- Tab: ANSYS / CAE ---
         ansys_tab = QtWidgets.QWidget()
@@ -1680,6 +2248,7 @@ class MainWindow(QtWidgets.QMainWindow):
             min_component_voxels=int(self.min_island.value()),
             min_mesh_component_faces=int(self.min_mesh_faces.value()),
             volume_smooth_sigma_vox=float(self.vol_sigma.value()),
+            meshing_downsample_factor=int(self.meshing_downsample.value()),
             smooth_iterations=int(self.smooth.value()),
             export_cae_layers=do_cae,
             export_geometry_preview=do_geo,
@@ -1694,6 +2263,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_box.clear()
         self._append_log("Starting…")
         self.open_out_btn.setEnabled(False)
+        try:
+            self.mesh_preview.set_meshes(None, None, {})
+        except Exception:
+            pass
 
         self.run_btn.setEnabled(False)
         self.thread = QtCore.QThread()
@@ -1703,11 +2276,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.progress.setValue)
         self.worker.log.connect(self._append_log)
+        self.worker.meshes_ready.connect(self._update_preview)
         self.worker.finished.connect(self._done)
         self.worker.finished.connect(self.thread.quit)
         self.thread.finished.connect(self.thread.deleteLater)
 
         self.thread.start()
+
+    def _update_preview(self, before: object, after: object, stats: object) -> None:
+        try:
+            self.mesh_preview.set_meshes(before, after, stats if isinstance(stats, dict) else {})
+        except Exception:
+            pass
 
     def _done(self, ok: bool, message: str, outputs: object) -> None:
         self.run_btn.setEnabled(True)

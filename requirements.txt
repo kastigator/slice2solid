@@ -5,3 +5,10 @@ shapely
 rtree
 PySide6
 scikit-image
+pyqtgraph
+PyOpenGL
+vtk
+pyvista
+pyvistaqt
+qtpy
+python-docx

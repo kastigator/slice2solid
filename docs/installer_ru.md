@@ -18,8 +18,9 @@
 1) Собрать папку приложения:
 - `powershell -ExecutionPolicy Bypass -File .\\build_installer.ps1`
 
+Примечание: в GUI есть вкладка “Просмотр” (3D-превью сетки). Для максимально корректного отображения используется VTK (`vtk` + `pyvista` + `pyvistaqt`). Как лёгкий fallback возможен `pyqtgraph` + `PyOpenGL`.
+
 2) Если установлен Inno Setup (есть `iscc.exe`):
 - `build_installer.ps1` автоматически соберёт установщик.
 Иначе установите Inno Setup и выполните:
 - `iscc.exe tools\\installer\\slice2solid.iss`
-
