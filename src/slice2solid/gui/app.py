@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass
+from importlib import resources
 from pathlib import Path
 
 import numpy as np
 import trimesh
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 
 from slice2solid.core.insight_simulation import (
     invert_rowvec_matrix,
@@ -17,7 +20,9 @@ from slice2solid.core.insight_simulation import (
 )
 from slice2solid.core.insight_params import estimate_bead_width_mm, infer_stl_path_from_job, load_job_params
 from slice2solid.core.cae_orientation import compute_layer_orientations
+from slice2solid.core.ntop_bundle import export_voxel_centers_csv
 from slice2solid.core.voxelize import mesh_from_voxels_configured, voxelize_toolpath
+from slice2solid.app_info import APP_DISPLAY_NAME, AUTHOR, CONTACT_EMAIL, DEPARTMENT, ORGANIZATION, VERSION
 
 
 @dataclass
@@ -35,6 +40,7 @@ class JobConfig:
     smooth_iterations: int
     export_cae_layers: bool
     export_geometry_preview: bool
+    export_ntop_bundle: bool = True
     ansys_min_confidence: float = 0.2
     ansys_group_size_layers: int = 1
     ansys_create_named_selections: bool = True
@@ -58,10 +64,10 @@ class Worker(QtCore.QObject):
             slice_h = sim_header.slice_height_mm or 0.254
 
             if not self.cfg.export_cae_layers and not self.cfg.export_geometry_preview:
-                raise ValueError("No outputs selected: enable Geometry preview and/or ANSYS export.")
+                raise ValueError("Не выбраны выходные файлы: включите Геометрию и/или экспорт для ANSYS.")
 
             if self.cfg.export_geometry_preview:
-                self.log.emit("Loading placed STL…")
+                self.log.emit("Загрузка placed STL…")
                 mesh = trimesh.load_mesh(self.cfg.placed_stl, force="mesh")
                 bounds_min = mesh.bounds[0]
                 bounds_max = mesh.bounds[1]
@@ -69,11 +75,11 @@ class Worker(QtCore.QObject):
                 bounds_min = None
                 bounds_max = None
 
-            self.log.emit("Preparing coordinate transform (CMB -> placed STL)…")
+            self.log.emit("Подготовка преобразования координат (CMB → placed STL)…")
             stl_to_cmb = sim_header.stl_to_cmb
             cmb_to_stl = invert_rowvec_matrix(stl_to_cmb)
 
-            self.log.emit("Streaming toolpath points (Type=1)…")
+            self.log.emit("Чтение точек траектории (Type=1)…")
             # Transform on the fly: we will buffer points to transform in chunks for speed.
             buffer_xyz: list[list[float]] = []
             buffer_area: list[float] = []
@@ -165,7 +171,7 @@ class Worker(QtCore.QObject):
                 bmin = bounds_min - pad
                 bmax = bounds_max + pad
 
-                self.log.emit("Voxelizing…")
+                self.log.emit("Вокселизация…")
                 self.progress.emit(35)
                 vox = voxelize_toolpath(
                     pts_iter,
@@ -180,34 +186,66 @@ class Worker(QtCore.QObject):
                 )
                 self.progress.emit(70)
 
-                self.log.emit("Extracting mesh (marching cubes)…")
+                self.log.emit("Построение сетки (marching cubes)…")
                 preview_mesh = mesh_from_voxels_configured(
                     vox,
                     volume_smooth_sigma_vox=self.cfg.volume_smooth_sigma_vox,
                     min_component_faces=self.cfg.min_mesh_component_faces,
                 )
                 if self.cfg.smooth_iterations > 0:
-                    self.log.emit(f"Smoothing mesh ({self.cfg.smooth_iterations} iterations)…")
+                    self.log.emit(f"Сглаживание сетки ({self.cfg.smooth_iterations} итераций)…")
                     trimesh.smoothing.filter_laplacian(preview_mesh, iterations=int(self.cfg.smooth_iterations))
                 self.progress.emit(85)
 
             out_dir = Path(self.cfg.output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_stl = out_dir / "preview_structure.stl"
+            # Prefix geometry outputs to reduce confusion with the user-provided "placed STL".
+            preview_stem = _preview_mesh_stem(self.cfg)
+            out_stl = out_dir / f"{preview_stem}.stl"
+            out_ply = out_dir / f"{preview_stem}.ply"
+            out_recipe = out_dir / "ntop_recipe.txt"
+            out_points = out_dir / "ntop_points.csv"
             out_json = out_dir / "metadata.json"
             out_layers_json = out_dir / "ansys_layers.json"
             out_layers_csv = out_dir / "ansys_layers.csv"
             out_ansys_script = out_dir / "ansys_mechanical_import_layers.py"
 
             outputs: list[str] = []
+            ntop_written = False
 
             if self.cfg.export_geometry_preview and preview_mesh is not None:
-                self.log.emit(f"Writing {out_stl}…")
+                self.log.emit(f"Запись {out_stl}…")
                 preview_mesh.export(out_stl)
                 outputs.append(str(out_stl))
+                if self.cfg.export_ntop_bundle:
+                    try:
+                        self.log.emit(f"Запись {out_ply}…")
+                        preview_mesh.export(out_ply)
+                        outputs.append(str(out_ply))
+
+                        recipe = _render_ntop_recipe(self.cfg)
+                        out_recipe.write_text(recipe, encoding="utf-8")
+                        outputs.append(str(out_recipe))
+
+                        if vox is not None:
+                            self.log.emit(f"Запись {out_points}…")
+                            res = export_voxel_centers_csv(
+                                vox.occupied,
+                                origin_xyz_mm=vox.origin,
+                                voxel_size_mm=float(vox.voxel_size),
+                                out_csv=out_points,
+                                max_points=250_000,
+                                include_header=False,
+                            )
+                            note = "sampled" if res.sampled else "all"
+                            self.log.emit(f"nTop точки: {res.points_written:,}/{res.points_total:,} ({note})")
+                            outputs.append(str(out_points))
+                        ntop_written = True
+                    except Exception as e:
+                        self.log.emit(f"nTop bundle пропущен: {e}")
 
             if self.cfg.export_cae_layers:
-                self.log.emit(f"Writing {out_layers_json}…")
+                self.log.emit(f"Запись {out_layers_json}…")
                 out_layers_json.write_text(
                     json.dumps(
                         {
@@ -234,7 +272,7 @@ class Worker(QtCore.QObject):
                     encoding="utf-8",
                 )
                 outputs.append(str(out_layers_json))
-                self.log.emit(f"Writing {out_layers_csv}…")
+                self.log.emit(f"Запись {out_layers_csv}…")
                 lines = ["layer_id,z_min_mm,z_max_mm,angle_deg,dx,dy,dz,confidence,segments_used,total_weight"]
                 for l in layers:
                     if l.dir_xyz is None:
@@ -249,7 +287,7 @@ class Worker(QtCore.QObject):
                 out_layers_csv.write_text("\n".join(lines), encoding="utf-8")
                 outputs.append(str(out_layers_csv))
 
-                self.log.emit(f"Writing {out_ansys_script}…")
+                self.log.emit(f"Запись {out_ansys_script}…")
                 out_ansys_script.write_text(_render_ansys_mechanical_script(self.cfg), encoding="utf-8")
                 outputs.append(str(out_ansys_script))
 
@@ -280,12 +318,73 @@ class Worker(QtCore.QObject):
             if self.cfg.export_cae_layers:
                 extra = f", {out_layers_json.name}, {out_layers_csv.name}, {out_ansys_script.name}"
             if self.cfg.export_geometry_preview:
-                base = f"{out_stl.name}, {out_json.name}{extra}"
+                ntop_part = f", {out_ply.name}, {out_recipe.name}" if ntop_written else ""
+                if ntop_written:
+                    ntop_part = f", {out_ply.name}, {out_points.name}, {out_recipe.name}"
+                base = f"{out_stl.name}{ntop_part}, {out_json.name}{extra}"
             else:
                 base = f"{out_json.name}{extra}"
-            self.finished.emit(True, f"Done. Outputs: {base}", outputs)
+            self.finished.emit(True, f"Готово. Файлы: {base}", outputs)
         except Exception as e:
-            self.finished.emit(False, f"Error: {e}", [])
+            self.finished.emit(False, f"Ошибка: {e}", [])
+
+
+def _load_app_icon() -> QtGui.QIcon:
+    try:
+        svg_bytes = resources.files("slice2solid.gui.assets").joinpath("herb.svg").read_bytes()
+    except Exception:
+        return QtGui.QIcon()
+
+    renderer = QtSvg.QSvgRenderer(QtCore.QByteArray(svg_bytes))
+    if not renderer.isValid():
+        return QtGui.QIcon()
+
+    icon = QtGui.QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        img = QtGui.QImage(size, size, QtGui.QImage.Format.Format_ARGB32)
+        img.fill(QtCore.Qt.GlobalColor.transparent)
+        p = QtGui.QPainter(img)
+        renderer.render(p, QtCore.QRectF(0, 0, size, size))
+        p.end()
+        icon.addPixmap(QtGui.QPixmap.fromImage(img))
+    return icon
+
+
+def _load_logo_pixmap(size: int = 72) -> QtGui.QPixmap | None:
+    try:
+        svg_bytes = resources.files("slice2solid.gui.assets").joinpath("herb.svg").read_bytes()
+    except Exception:
+        return None
+
+    renderer = QtSvg.QSvgRenderer(QtCore.QByteArray(svg_bytes))
+    if not renderer.isValid():
+        return None
+
+    img = QtGui.QImage(size, size, QtGui.QImage.Format.Format_ARGB32)
+    img.fill(QtCore.Qt.GlobalColor.transparent)
+    p = QtGui.QPainter(img)
+    p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+    renderer.render(p, QtCore.QRectF(0, 0, size, size))
+    p.end()
+    return QtGui.QPixmap.fromImage(img)
+
+
+def _about_html() -> str:
+    title = html.escape(APP_DISPLAY_NAME)
+    version = html.escape(VERSION)
+    author = html.escape(AUTHOR)
+    org = html.escape(ORGANIZATION)
+    dept = html.escape(DEPARTMENT)
+    email = html.escape(CONTACT_EMAIL)
+    return (
+        f"<div style='font-size: 14px'>"
+        f"<b>{title}</b> <span style='color: #666'>v{version}</span><br>"
+        f"<span style='color: #444'>{author}</span><br>"
+        f"<span style='color: #444'>{org}</span><br>"
+        f"<span style='color: #444'>{dept}</span><br><br>"
+        f"Контакты: <a href='mailto:{email}'>{email}</a>"
+        f"</div>"
+    )
 
 
 _ANSYS_MECHANICAL_SCRIPT_TEMPLATE = r'''# slice2solid → ANSYS Mechanical (Workbench) import helper
@@ -570,8 +669,62 @@ def _render_ansys_mechanical_script(cfg: JobConfig) -> str:
     return header + _ANSYS_MECHANICAL_SCRIPT_TEMPLATE
 
 
+def _safe_filename_stem(name: str) -> str:
+    # Keep it Windows-friendly and readable.
+    name = name.strip()
+    if not name:
+        return "part"
+    name = re.sub(r"[^0-9A-Za-zА-Яа-я._-]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("._-")
+    return name or "part"
+
+
+def _format_token(x: float, *, decimals: int = 3) -> str:
+    s = f"{float(x):.{int(decimals)}f}"
+    s = s.rstrip("0").rstrip(".")
+    return s.replace(".", "p")
+
+
+def _preview_mesh_stem(cfg: JobConfig) -> str:
+    part = _safe_filename_stem(Path(cfg.placed_stl).stem)
+    vox = _format_token(cfg.voxel_size_mm, decimals=3)
+    sig = _format_token(cfg.volume_smooth_sigma_vox, decimals=3)
+    it = int(cfg.smooth_iterations)
+    return f"{part}_vox{vox}_sig{sig}_it{it}_s2s_preview_structure"
+
+
+def _render_ntop_recipe(cfg: JobConfig) -> str:
+    v = float(cfg.voxel_size_mm)
+    suggested = max(0.5 * v, 0.02)
+    preview_stem = _preview_mesh_stem(cfg)
+    return (
+        "slice2solid → nTop: рекомендуемый workflow\n"
+        "\n"
+        "Файлы в папке результата:\n"
+        f" - {preview_stem}.stl  (mesh)\n"
+        f" - {preview_stem}.ply  (mesh; alternative import)\n"
+        " - ntop_points.csv        (point cloud from occupied voxels; format: x, y, z; no header; may be sampled)\n"
+        " - metadata.json          (параметры/статистика)\n"
+        "\n"
+        "Шаги в nTop (типовой путь):\n"
+        f" 1) Utilities → Import Mesh → {preview_stem}.stl (Units: mm)\n"
+        " 2) Search: \"Implicit Body from Mesh\" → convert mesh to implicit\n"
+        " 3) (Optional) Smooth/Close/Repair on the implicit body\n"
+        " 4) Convert implicit to CAD/solid body\n"
+        " 5) Export STEP\n"
+        "\n"
+        "Альтернатива (иногда лучше для решёток/заполнений):\n"
+        " - Import point list (CSV) → create implicit from points → then Convert to CAD/Solid → Export STEP\n"
+        "\n"
+        "Стартовые параметры (подсказка):\n"
+        f" - slice2solid voxel_size_mm = {v:.3f}\n"
+        f" - nTop implicit resolution/spacing: ~{suggested:.3f} mm (≈ 0.5 * voxel_size)\n"
+        "   Если слишком медленно: увеличьте spacing. Если теряются детали: уменьшите spacing.\n"
+    )
+
+
 _HELP_HTML = """
-<h2>slice2solid — Help</h2>
+<h2>slice2solid — Справка</h2>
 
 <p><b>Подсказки в интерфейсе:</b> наведите курсор на параметр, чтобы увидеть tooltip. Также можно нажать <b>Shift+F1</b> и кликнуть по элементу, чтобы открыть “What’s This?”.</p>
 
@@ -580,19 +733,23 @@ _HELP_HTML = """
   <li><b>Simulation export (*.txt)</b>: Insight → Toolpaths → Simulation data export.</li>
   <li><b>Slicer job folder (ssys_*)</b>: папка задания, где лежат <code>toolpathParams.*</code>, <code>sliceParams.*</code> (нужно для auto-ширины дорожки).</li>
   <li><b>Placed STL (*.stl)</b>: STL после ориентации/размещения на столе в Insight.</li>
-  <li><b>Output folder</b>: папка результата (сюда пишутся файлы).</li>
+  <li><b>Папка результата (Output folder)</b>: сюда пишутся файлы.</li>
 </ol>
 
 <h3>2) Вкладка “nTop / Geometry”</h3>
 <ul>
-  <li>Выход: <code>preview_structure.stl</code> + <code>metadata.json</code>.</li>
-  <li><b>Presets</b> — быстрые наборы настроек. Выберите пресет и нажмите <b>Apply</b>. При ручных изменениях режим становится <b>Custom</b>.</li>
+  <li>Выход: <code>*_s2s_preview_structure.stl</code> + (опционально) <code>*_s2s_preview_structure.ply</code>, <code>ntop_points.csv</code>, <code>ntop_recipe.txt</code> + <code>metadata.json</code> (в имени mesh-файлов есть имя детали и параметры).</li>
+  <li><b>Пресеты</b> — быстрые наборы настроек. Выберите пресет и нажмите <b>Применить</b>. При ручных изменениях режим становится <b>Custom</b>.</li>
   <li><b>Voxel size</b> — главный “качество↔скорость”. Меньше → точнее, но сильно тяжелее по RAM/времени и размеру STL.</li>
   <li><b>Volume smoothing</b> (sigma, vox) сглаживает сам воксельный объём перед построением поверхности — уменьшает “ступеньки”.</li>
   <li><b>Mesh smoothing</b> сглаживает уже готовую сетку (Laplacian) — убирает “рывки”, но может замыливать мелкие детали.</li>
-  <li>Если появляются “лишние перемычки/линии” между отдельными дорожками: включите <b>Ignore travel jumps</b> и/или уменьшите <b>max jump</b> (если доступно), увеличьте <b>Remove noise</b>.</li>
-  <li>Если есть мелкие “островки” сетки вокруг: увеличьте <b>Remove mesh islands</b>.</li>
+  <li>Если появляются "лишние перемычки/линии" между отдельными дорожками: включите <b>Ignore travel jumps</b> и/или уменьшите <b>max jump</b> (если доступно), увеличьте <b>Remove noise</b>.</li>
+  <li>Если есть мелкие "островки" сетки вокруг: увеличьте <b>Remove mesh islands</b>.</li>
 </ul>
+
+<p><b>Как получить гладкий STEP в nTop (рекомендуется для решёток/заполнений):</b><br/>
+Utilities → <b>Import Mesh</b> → затем <b>Implicit Body from Mesh</b> → (по ситуации: Smooth/Close/Repair) → Convert to CAD/Solid → Export STEP.<br/>
+Если включён <b>nTop bundle</b>, рядом с STL будет файл <code>ntop_recipe.txt</code> с подсказками по стартовым параметрам.</p>
 
 <h3>Быстрый гайд по параметрам (что крутить)</h3>
 <table border="1" cellpadding="6" cellspacing="0">
@@ -652,7 +809,7 @@ _HELP_HTML = """
 <ul>
   <li>Выход: <code>ansys_layers.json</code>, <code>ansys_layers.csv</code>, <code>ansys_mechanical_import_layers.py</code>.</li>
   <li>Идея: назначить ортотропию по слоям (X вдоль печати, Z — build direction).</li>
-  <li><b>Presets</b> на вкладке ANSYS меняют параметры генерируемого Mechanical-скрипта (группировка слоёв, порог confidence, создавать ли NS/CS).</li>
+  <li><b>Пресеты</b> на вкладке ANSYS меняют параметры генерируемого Mechanical-скрипта (группировка слоёв, порог confidence, создавать ли NS/CS).</li>
 </ul>
 <ol>
   <li>Откройте ANSYS Mechanical, импортируйте геометрию, сделайте <b>Mesh</b>.</li>
@@ -669,6 +826,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("slice2solid — Восстановление структуры (MVP)")
+        self.setWindowIcon(_load_app_icon())
         self.resize(920, 640)
 
         def _set_help(widget: QtWidgets.QWidget, *, title: str, body: str, pros: str = "", cons: str = "", tip: str = "") -> None:
@@ -683,15 +841,24 @@ class MainWindow(QtWidgets.QMainWindow):
             widget.setToolTip(html)
             widget.setWhatsThis(html)
 
+        help_menu = self.menuBar().addMenu("Справка")
+        about_action = QtGui.QAction("О программе", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+        howto_action = QtGui.QAction("Как пользоваться", self)
+        howto_action.triggered.connect(self._show_help)
+        help_menu.addAction(howto_action)
+
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
 
         header = QtWidgets.QLabel(
-            "Цель: получить `preview_structure.stl`, который открывается в nTop и "
+            "Цель: получить `*_s2s_preview_structure.stl`, который открывается в nTop и "
             "дальше конвертируется в solid/STEP средствами nTop.\n"
             "Поддержки/подложка (`Type=0`) игнорируются; используется только траектория модели (`Type=1`).\n"
             "Подсказки: наведите курсор на параметр (или Shift+F1 → клик)."
+            "Пайплайн: Import Mesh → Implicit Body from Mesh → (Smooth/Close/Repair) → Convert to CAD/Solid → Export STEP."
         )
         header.setWordWrap(True)
         layout.addWidget(header)
@@ -706,11 +873,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "Файл экспорта Stratasys Insight: Toolpaths → Simulation data export.\n"
             "Внутри есть таблица X/Y/Z/Bead Area/Type/BeadMode и матрица STL↔CMB."
         )
-        self.sim_btn = QtWidgets.QPushButton("Browse…")
+        self.sim_btn = QtWidgets.QPushButton("Обзор…")
         sim_row = QtWidgets.QHBoxLayout()
         sim_row.addWidget(self.sim_edit, 1)
         sim_row.addWidget(self.sim_btn)
-        io_form.addRow("Simulation export (*.txt):", sim_row)
+        io_form.addRow("Экспорт симуляции (*.txt):", sim_row)
 
         self.job_edit = QtWidgets.QLineEdit()
         self.job_edit.setPlaceholderText(r"Например: ...\ssys_part-table")
@@ -718,11 +885,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "Папка задания Stratasys Insight (ssys_*).\n"
             "Нужна для чтения `toolpathParams.*` и автоматического определения ширины дорожки."
         )
-        self.job_btn = QtWidgets.QPushButton("Browse…")
+        self.job_btn = QtWidgets.QPushButton("Обзор…")
         job_row = QtWidgets.QHBoxLayout()
         job_row.addWidget(self.job_edit, 1)
         job_row.addWidget(self.job_btn)
-        io_form.addRow("Slicer job folder (ssys_*):", job_row)
+        io_form.addRow("Папка задания (ssys_*):", job_row)
 
         self.stl_edit = QtWidgets.QLineEdit()
         self.stl_edit.setPlaceholderText(r"Например: ...\part-table.stl (placed STL)")
@@ -730,38 +897,40 @@ class MainWindow(QtWidgets.QMainWindow):
             "Placed STL — STL после ориентации/размещения на столе в Insight.\n"
             "Используется как эталонная геометрия/габариты для вокселизации и проверки координат."
         )
-        self.stl_btn = QtWidgets.QPushButton("Browse…")
+        self.stl_btn = QtWidgets.QPushButton("Обзор…")
         stl_row = QtWidgets.QHBoxLayout()
         stl_row.addWidget(self.stl_edit, 1)
         stl_row.addWidget(self.stl_btn)
         io_form.addRow("Placed STL (*.stl):", stl_row)
 
         self.out_edit = QtWidgets.QLineEdit()
-        self.out_edit.setPlaceholderText(r"Папка, куда будут записаны preview_structure.stl и metadata.json")
+        self.out_edit.setPlaceholderText(
+            r"Папка результата (*_s2s_preview_structure.stl/ply, ntop_recipe.txt, metadata.json, ...)"
+        )
         _set_help(
             self.out_edit,
-            title="Output folder",
+            title="Папка результата",
             body="Папка, куда программа запишет результаты.",
             pros="Можно запускать несколько раз в разные папки и сравнивать параметры.",
             cons="Большие STL могут занимать много места.",
             tip="Для экспериментов создайте отдельную папку на каждый прогон (например, out_0p10_sigma1).",
         )
-        self.out_btn = QtWidgets.QPushButton("Browse…")
+        self.out_btn = QtWidgets.QPushButton("Обзор…")
         out_row = QtWidgets.QHBoxLayout()
         out_row.addWidget(self.out_edit, 1)
         out_row.addWidget(self.out_btn)
-        io_form.addRow("Output folder:", out_row)
+        io_form.addRow("Папка результата:", out_row)
 
         tabs = QtWidgets.QTabWidget()
         layout.addWidget(tabs, 1)
 
         # --- Tab: nTop / Geometry preview ---
         geometry_tab = QtWidgets.QWidget()
-        tabs.addTab(geometry_tab, "nTop / Geometry")
+        tabs.addTab(geometry_tab, "nTop / Геометрия")
         geo_layout = QtWidgets.QVBoxLayout(geometry_tab)
 
         geo_intro = QtWidgets.QLabel(
-            "Режим nTop: восстановление внутренней структуры и экспорт `preview_structure.stl`.\n"
+            "Режим nTop: восстановление внутренней структуры и экспорт `*_s2s_preview_structure.stl`.\n"
             "Дальше: nTop → mesh → implicit → solidify/repair → экспорт STEP."
         )
         geo_intro.setWordWrap(True)
@@ -771,11 +940,19 @@ class MainWindow(QtWidgets.QMainWindow):
         geo_form = QtWidgets.QFormLayout(geo_group)
         geo_layout.addWidget(geo_group)
 
-        self.export_geometry = QtWidgets.QCheckBox("Generate preview_structure.stl")
+        self.export_geometry = QtWidgets.QCheckBox("Сгенерировать STL (предпросмотр) (*_s2s_preview_structure.stl)")
         self.export_geometry.setChecked(True)
         self.export_geometry.setToolTip("Отключите, если нужен только экспорт для ANSYS (карта слоёв).")
         self.export_geometry.setWhatsThis(self.export_geometry.toolTip())
-        geo_form.addRow("Geometry output:", self.export_geometry)
+        geo_form.addRow("Выходная геометрия:", self.export_geometry)
+
+        self.export_ntop = QtWidgets.QCheckBox("Экспортировать набор для nTop (PLY + ntop_points.csv + ntop_recipe.txt)")
+        self.export_ntop.setChecked(True)
+        self.export_ntop.setToolTip(
+            "Доп. файлы для nTop: PLY (mesh), ntop_points.csv (point cloud из вокселей) и краткий рецепт импорта/параметров."
+        )
+        self.export_ntop.setWhatsThis(self.export_ntop.toolTip())
+        geo_form.addRow("Набор для nTop:", self.export_ntop)
 
         self.voxel_size = QtWidgets.QDoubleSpinBox()
         self.voxel_size.setRange(0.05, 5.0)
@@ -784,15 +961,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.voxel_size.setDecimals(3)
         _set_help(
             self.voxel_size,
-            title="Voxel size (mm)",
+            title="Размер вокселя (Voxel size), мм",
             body="Размер вокселя (мм): из этой сетки строится поверхность (marching cubes).",
             pros="Меньше → более гладкая/точная поверхность.",
             cons="Меньше → очень сильный рост RAM/времени и размера STL (приблизительно кубически).",
-            tip="Если поверхность “ступеньками”: сначала включите Volume smoothing (≈1.0), и только потом уменьшайте voxel size.",
+            tip="Если поверхность “ступеньками”: сначала включите сглаживание объёма (Volume smoothing, ≈1.0), и только потом уменьшайте voxel size.",
         )
-        geo_form.addRow("Voxel size (mm):", self.voxel_size)
+        geo_form.addRow("Размер вокселя (мм):", self.voxel_size)
 
-        self.auto_radius = QtWidgets.QCheckBox("Auto (from slicer params)")
+        self.auto_radius = QtWidgets.QCheckBox("Авто (из параметров слайсера)")
         self.auto_radius.setChecked(True)
         _set_help(
             self.auto_radius,
@@ -816,7 +993,7 @@ class MainWindow(QtWidgets.QMainWindow):
             cons="Слишком низко → тонкие стенки/ребра могут исчезнуть.",
             tip="Типичные значения: 1.0–2.5 мм. Если модель ‘разваливается’ — увеличьте.",
         )
-        self.radius_hint = QtWidgets.QLabel("Auto: unknown (select ssys_* folder)")
+        self.radius_hint = QtWidgets.QLabel("Авто: неизвестно (выберите папку ssys_*)")
         _set_help(
             self.radius_hint,
             title="Bead radius (auto) status",
@@ -827,77 +1004,84 @@ class MainWindow(QtWidgets.QMainWindow):
         radius_row.addWidget(self.auto_radius)
         radius_row.addWidget(self.max_radius)
         radius_row.addWidget(self.radius_hint, 1)
-        geo_form.addRow("Bead radius limit:", radius_row)
+        geo_form.addRow("Ограничение радиуса дорожки:", radius_row)
 
         self.estimate = QtWidgets.QLabel("Оценка: —")
         self.estimate.setWordWrap(True)
         _set_help(
             self.estimate,
-            title="Grid estimate",
+            title="Оценка сетки",
             body="Прикидка размеров воксельной сетки и ожидаемой нагрузки.",
             tip="Если оценка ‘слишком большая’ — увеличьте Voxel size или ограничьте область/геометрию.",
         )
-        geo_form.addRow("Grid estimate:", self.estimate)
+        geo_form.addRow("Оценка сетки:", self.estimate)
 
         # --- Presets ---
         self._applying_preset = False
         self.preset_combo = QtWidgets.QComboBox()
         self.preset_combo.addItems(["Custom", "Fast (draft)", "Balanced", "Quality"])
-        self.apply_preset_btn = QtWidgets.QPushButton("Apply")
+        self.preset_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.preset_combo.setMinimumContentsLength(18)
+        self.apply_preset_btn = QtWidgets.QPushButton("Применить")
+        self.apply_preset_btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
         preset_row = QtWidgets.QHBoxLayout()
+        preset_row.setContentsMargins(0, 0, 0, 0)
         preset_row.addWidget(self.preset_combo, 1)
         preset_row.addWidget(self.apply_preset_btn)
         preset_wrap = QtWidgets.QWidget()
+        preset_wrap.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         preset_wrap.setLayout(preset_row)
         _set_help(
             self.preset_combo,
-            title="Presets",
+            title="Пресеты",
             body="Готовые наборы параметров для быстрого старта.",
             pros="Ускоряет настройку для новичков.",
             cons="Не учитывает все особенности детали/траектории.",
-            tip="Выберите пресет и нажмите Apply. При ручных изменениях режим станет Custom.",
+            tip="Выберите пресет и нажмите Применить. При ручных изменениях режим станет Custom.",
         )
         self.apply_preset_btn.setToolTip("Применить выбранный пресет к параметрам геометрии.")
         self.apply_preset_btn.setWhatsThis(self.apply_preset_btn.toolTip())
-        geo_form.addRow("Presets:", preset_wrap)
+        geo_form.addRow("Пресеты:", preset_wrap)
 
-        self.jump_filter = QtWidgets.QCheckBox("Ignore travel jumps between toolpaths (recommended)")
+        self.jump_filter = QtWidgets.QCheckBox("Игнорировать перемещения (travel jumps) между траекториями (рекомендуется)")
         self.jump_filter.setChecked(True)
         _set_help(
             self.jump_filter,
-            title="Ignore travel jumps",
+            title="Игнорирование перемещений (travel jumps)",
             body="Игнорирует длинные перемещения между разорванными траекториями (travel/jump), чтобы не ‘заливать’ материал по воздуху.",
             pros="Убирает ложные перемычки и внутренние ‘нитки’.",
             cons="Если траектория реально разорвана короткими прыжками, можно получить разрывы (редко).",
             tip="Обычно держите включённым. Если появились неожиданные дырки — попробуйте временно выключить и сравнить.",
         )
-        geo_form.addRow("Toolpath filter:", self.jump_filter)
+        geo_form.addRow("Фильтр траектории:", self.jump_filter)
 
         self.min_island = QtWidgets.QSpinBox()
         self.min_island.setRange(0, 10000)
         self.min_island.setValue(150)
         _set_help(
             self.min_island,
-            title="Remove noise (min voxels)",
+            title="Удаление шума (мин. вокселей)",
             body="Удаляет маленькие компоненты вокселей до построения сетки (3D связность).",
             pros="Убирает ‘мусор’ и ускоряет построение сетки.",
             cons="Слишком большое значение может удалить тонкие элементы.",
             tip="Начните с 150–300. Если вокруг много мелких точек — увеличьте; если теряются тонкие элементы — уменьшите.",
         )
-        geo_form.addRow("Remove noise (min voxels):", self.min_island)
+        geo_form.addRow("Удаление шума (мин. вокселей):", self.min_island)
 
         self.min_mesh_faces = QtWidgets.QSpinBox()
         self.min_mesh_faces.setRange(0, 50_000_000)
         self.min_mesh_faces.setValue(2000)
         _set_help(
             self.min_mesh_faces,
-            title="Remove mesh islands (min faces)",
+            title="Удаление островков (мин. граней)",
             body="После построения поверхности удаляет куски сетки, у которых меньше указанного числа граней.",
             pros="Убирает мелкие ‘островки’/пылинки вокруг структуры.",
             cons="Слишком большое значение может удалить полезные мелкие детали.",
             tip="Если много мусора вокруг — увеличьте. Если пропадают нужные мелкие элементы — уменьшите.",
         )
-        geo_form.addRow("Remove mesh islands (min faces):", self.min_mesh_faces)
+        geo_form.addRow("Удаление островков (мин. граней):", self.min_mesh_faces)
 
         self.vol_sigma = QtWidgets.QDoubleSpinBox()
         self.vol_sigma.setRange(0.0, 5.0)
@@ -906,26 +1090,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vol_sigma.setDecimals(2)
         _set_help(
             self.vol_sigma,
-            title="Volume smoothing (sigma, vox)",
+            title="Сглаживание объёма (sigma, vox)",
             body="Гауссово сглаживание воксельного объёма перед marching cubes (sigma в вокселях).",
             pros="Сильно уменьшает “ступеньки/пилу” без большого роста времени.",
             cons="Слишком большое sigma может ‘съесть’ тонкие стенки и сгладить мелкие детали.",
             tip="Для более гладкой поверхности начните с 1.0. Если тонкие элементы размываются — снизьте до 0.6–0.8.",
         )
-        geo_form.addRow("Volume smoothing (sigma, vox):", self.vol_sigma)
+        geo_form.addRow("Сглаживание объёма (sigma, vox):", self.vol_sigma)
 
         self.smooth = QtWidgets.QSpinBox()
         self.smooth.setRange(0, 200)
         self.smooth.setValue(0)
         _set_help(
             self.smooth,
-            title="Mesh smoothing (iterations)",
+            title="Сглаживание сетки (итерации)",
             body="Сглаживание уже готовой сетки (Laplacian).",
             pros="Убирает ‘рывки’ и делает поверхность приятнее для имплицитизации в nTop.",
             cons="Может вызывать усадку/замыливание деталей при больших значениях.",
             tip="10–30 обычно достаточно. Если форма начинает ‘плыть’ — уменьшите.",
         )
-        geo_form.addRow("Mesh smoothing (iterations):", self.smooth)
+        geo_form.addRow("Сглаживание сетки (итерации):", self.smooth)
 
         geo_layout.addStretch(1)
 
@@ -945,31 +1129,38 @@ class MainWindow(QtWidgets.QMainWindow):
         ansys_form = QtWidgets.QFormLayout(ansys_group)
         ansys_layout.addWidget(ansys_group)
 
-        self.export_cae = QtWidgets.QCheckBox("Export layer orientation map (ANSYS)")
+        self.export_cae = QtWidgets.QCheckBox("Экспортировать карту ориентации слоёв (ANSYS)")
         self.export_cae.setChecked(True)
-        ansys_form.addRow("CAE output:", self.export_cae)
+        ansys_form.addRow("Выход CAE:", self.export_cae)
 
         # --- Mechanical script presets/options ---
         self._applying_ansys_preset = False
         self.ansys_preset_combo = QtWidgets.QComboBox()
         self.ansys_preset_combo.addItems(["Custom", "Detailed (per layer)", "Fast (group 5 layers)", "CS only (group 5)"])
-        self.apply_ansys_preset_btn = QtWidgets.QPushButton("Apply")
+        self.ansys_preset_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.ansys_preset_combo.setMinimumContentsLength(22)
+        self.apply_ansys_preset_btn = QtWidgets.QPushButton("Применить")
+        self.apply_ansys_preset_btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
         ansys_preset_row = QtWidgets.QHBoxLayout()
+        ansys_preset_row.setContentsMargins(0, 0, 0, 0)
         ansys_preset_row.addWidget(self.ansys_preset_combo, 1)
         ansys_preset_row.addWidget(self.apply_ansys_preset_btn)
         ansys_preset_wrap = QtWidgets.QWidget()
+        ansys_preset_wrap.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         ansys_preset_wrap.setLayout(ansys_preset_row)
         _set_help(
             self.ansys_preset_combo,
-            title="ANSYS presets",
+            title="Пресеты ANSYS",
             body="Наборы настроек для генерируемого Mechanical-скрипта.",
             pros="Ускоряет старт: можно уменьшить число Named Selections/CS за счёт группировки слоёв.",
             cons="Группировка снижает ‘детальность’ ориентации по высоте.",
-            tip="Выберите пресет и нажмите Apply. При ручных изменениях режим станет Custom.",
+            tip="Выберите пресет и нажмите Применить. При ручных изменениях режим станет Custom.",
         )
         self.apply_ansys_preset_btn.setToolTip("Применить выбранный пресет к параметрам Mechanical-скрипта.")
         self.apply_ansys_preset_btn.setWhatsThis(self.apply_ansys_preset_btn.toolTip())
-        ansys_form.addRow("Presets:", ansys_preset_wrap)
+        ansys_form.addRow("Пресеты:", ansys_preset_wrap)
 
         self.ansys_min_conf = QtWidgets.QDoubleSpinBox()
         self.ansys_min_conf.setRange(0.0, 1.0)
@@ -1035,15 +1226,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- Tab: Help ---
         help_tab = QtWidgets.QWidget()
-        tabs.addTab(help_tab, "Help")
+        tabs.addTab(help_tab, "Справка")
         help_layout = QtWidgets.QVBoxLayout(help_tab)
+        help_btn_row = QtWidgets.QHBoxLayout()
+        self.about_btn = QtWidgets.QPushButton("О программе")
+        self.howto_btn = QtWidgets.QPushButton("Как пользоваться")
+        help_btn_row.addWidget(self.about_btn)
+        help_btn_row.addWidget(self.howto_btn)
+        help_btn_row.addStretch(1)
+        help_layout.addLayout(help_btn_row)
         self.help_view = QtWidgets.QTextBrowser()
         self.help_view.setOpenExternalLinks(True)
         self.help_view.setHtml(_HELP_HTML)
         help_layout.addWidget(self.help_view, 1)
 
         # --- Run + Outputs ---
-        self.run_btn = QtWidgets.QPushButton("Run")
+        self.run_btn = QtWidgets.QPushButton("Запуск")
         self.run_btn.setMinimumHeight(36)
         layout.addWidget(self.run_btn)
 
@@ -1051,7 +1249,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setRange(0, 100)
         layout.addWidget(self.progress)
 
-        outputs_group = QtWidgets.QGroupBox("Outputs")
+        outputs_group = QtWidgets.QGroupBox("Результаты")
         out_layout = QtWidgets.QVBoxLayout(outputs_group)
         layout.addWidget(outputs_group)
 
@@ -1060,9 +1258,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         out_btn_row = QtWidgets.QHBoxLayout()
         out_layout.addLayout(out_btn_row)
-        self.open_selected_btn = QtWidgets.QPushButton("Open selected")
-        self.copy_selected_btn = QtWidgets.QPushButton("Copy path")
-        self.open_out_btn = QtWidgets.QPushButton("Open output folder")
+        self.open_selected_btn = QtWidgets.QPushButton("Открыть выбранный")
+        self.copy_selected_btn = QtWidgets.QPushButton("Копировать путь")
+        self.open_out_btn = QtWidgets.QPushButton("Открыть папку результата")
         self.open_out_btn.setEnabled(False)
         self.open_selected_btn.setEnabled(False)
         self.copy_selected_btn.setEnabled(False)
@@ -1095,6 +1293,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vol_sigma.valueChanged.connect(self._recompute_estimate)
         self.smooth.valueChanged.connect(self._recompute_estimate)
         self.export_geometry.toggled.connect(self._recompute_estimate)
+        self.export_geometry.toggled.connect(self._update_step_widgets)
         self.open_out_btn.clicked.connect(self._open_output_folder)
         self.outputs_list.itemSelectionChanged.connect(self._update_output_buttons)
         self.outputs_list.itemDoubleClicked.connect(self._open_selected_output)
@@ -1103,10 +1302,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_preset_btn.clicked.connect(self._apply_selected_preset)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_selection_changed)
         self.apply_ansys_preset_btn.clicked.connect(self._apply_selected_ansys_preset)
+        self.about_btn.clicked.connect(self._show_about)
+        self.howto_btn.clicked.connect(self._show_help)
 
         # If user edits any parameter manually -> switch preset to Custom.
         for w in (
             self.export_geometry,
+            self.export_ntop,
             self.voxel_size,
             self.auto_radius,
             self.max_radius,
@@ -1122,7 +1324,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._connect_any_change(w, self._mark_ansys_preset_custom)
 
     def _pick_sim(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select simulation export", "", "Text (*.txt)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Выберите экспорт симуляции", "", "Text (*.txt)")
         if path:
             self.sim_edit.setText(path)
             self._auto_fill_from_sim(path)
@@ -1231,18 +1433,18 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._applying_ansys_preset = False
     def _pick_job(self) -> None:
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select ssys_* folder")
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку задания ssys_*")
         if path:
             self.job_edit.setText(path)
             self._auto_fill_from_job(path)
 
     def _pick_stl(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select placed STL", "", "STL (*.stl *.STL)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Выберите placed STL", "", "STL (*.stl *.STL)")
         if path:
             self.stl_edit.setText(path)
 
     def _pick_out(self) -> None:
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder")
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку результата")
         if path:
             self.out_edit.setText(path)
 
@@ -1299,9 +1501,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "   Нужно для Auto-определения ширины дорожки.\n\n"
             "3) Выберите Placed STL:\n"
             "   STL после размещения на столе (placed).\n\n"
-            "4) Выберите Output folder и нажмите Run.\n\n"
+            "4) Выберите папку результата и нажмите Запуск.\n\n"
             "Выход:\n"
-            " - preview_structure.stl (открывается в nTop)\n"
+            " - *_s2s_preview_structure.stl (открывается в nTop; имя включает деталь и параметры)\n"
+            " - *_s2s_preview_structure.ply, ntop_recipe.txt (опционально: bundle для nTop)\n"
+            " - ntop_points.csv (опционально: point cloud из вокселей для nTop)\n"
             " - metadata.json (параметры/матрица/статистика)\n\n"
             "В nTop: импортируйте STL → implicit/solidify/repair → экспорт STEP."
         )
@@ -1352,6 +1556,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.max_radius.setEnabled(manual)
         self.radius_hint.setVisible(not manual)
 
+    def _update_step_widgets(self) -> None:
+        enabled = bool(self.export_geometry.isChecked())
+        self.export_ntop.setEnabled(enabled)
+        if not enabled:
+            self.export_ntop.setChecked(False)
+
     def _recompute_auto_radius(self) -> None:
         if not self.auto_radius.isChecked():
             return
@@ -1359,10 +1569,10 @@ class MainWindow(QtWidgets.QMainWindow):
         job_dir = self.job_edit.text().strip()
         sim_path = self.sim_edit.text().strip()
         if not job_dir:
-            self.radius_hint.setText("Auto: unknown (select ssys_* folder)")
+            self.radius_hint.setText("Авто: неизвестно (выберите папку ssys_*)")
             return
         if not Path(job_dir).exists():
-            self.radius_hint.setText("Auto: folder not found")
+            self.radius_hint.setText("Авто: папка не найдена")
             return
 
         try:
@@ -1372,12 +1582,12 @@ class MainWindow(QtWidgets.QMainWindow):
             params = load_job_params(job_dir)
             bead_w = estimate_bead_width_mm(params, sim_slice_height_mm=header.slice_height_mm if header else None)
             if bead_w is None:
-                self.radius_hint.setText("Auto: could not read bead width")
+                self.radius_hint.setText("Авто: не удалось определить ширину дорожки")
                 return
             r = bead_w / 2.0
-            self.radius_hint.setText(f"Auto: width≈{bead_w:.3f} mm → radius≈{r:.3f} mm")
+            self.radius_hint.setText(f"Авто: ширина≈{bead_w:.3f} мм → радиус≈{r:.3f} мм")
         except Exception as e:
-            self.radius_hint.setText(f"Auto: error ({e})")
+            self.radius_hint.setText(f"Авто: ошибка ({e})")
 
     def _recompute_estimate(self) -> None:
         if hasattr(self, "export_geometry") and not self.export_geometry.isChecked():
@@ -1409,6 +1619,7 @@ class MainWindow(QtWidgets.QMainWindow):
         stl = self.stl_edit.text().strip()
         out = self.out_edit.text().strip()
         do_geo = bool(self.export_geometry.isChecked())
+        do_ntop = bool(self.export_ntop.isChecked()) and do_geo
         do_cae = bool(self.export_cae.isChecked())
         if not sim or not out or (do_geo and not stl):
             QtWidgets.QMessageBox.warning(
@@ -1418,7 +1629,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         if not do_geo and not do_cae:
-            QtWidgets.QMessageBox.warning(self, "Nothing to do", "Enable Geometry output and/or CAE output.")
+            QtWidgets.QMessageBox.warning(self, "Нечего делать", "Включите выходную геометрию и/или экспорт для ANSYS.")
             return
 
         max_r: float | None
@@ -1472,6 +1683,7 @@ class MainWindow(QtWidgets.QMainWindow):
             smooth_iterations=int(self.smooth.value()),
             export_cae_layers=do_cae,
             export_geometry_preview=do_geo,
+            export_ntop_bundle=do_ntop,
             ansys_min_confidence=float(self.ansys_min_conf.value()),
             ansys_group_size_layers=int(self.ansys_group_layers.value()),
             ansys_create_named_selections=bool(self.ansys_create_ns.isChecked()),
@@ -1506,6 +1718,45 @@ class MainWindow(QtWidgets.QMainWindow):
         if isinstance(outputs, list):
             self._set_outputs([str(x) for x in outputs])
         self.open_out_btn.setEnabled(True)
+
+    def _show_about(self) -> None:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("О программе")
+        dlg.setWindowIcon(_load_app_icon())
+        layout = QtWidgets.QVBoxLayout(dlg)
+
+        header = QtWidgets.QWidget()
+        header.setStyleSheet("background-color: #0B2A4A;")
+        header_layout = QtWidgets.QHBoxLayout(header)
+        header_layout.setContentsMargins(14, 12, 14, 12)
+        header_layout.setSpacing(12)
+
+        logo = _load_logo_pixmap(56)
+        if logo is not None and not logo.isNull():
+            logo_label = QtWidgets.QLabel()
+            logo_label.setPixmap(logo)
+            logo_label.setFixedSize(56, 56)
+            logo_label.setScaledContents(True)
+            header_layout.addWidget(logo_label, 0, QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        header_title = QtWidgets.QLabel("Белорусский государственный технологический университет")
+        header_title.setStyleSheet("color: white; font-weight: 600;")
+        header_title.setWordWrap(True)
+        header_layout.addWidget(header_title, 1)
+
+        layout.addWidget(header)
+
+        view = QtWidgets.QTextBrowser()
+        view.setOpenExternalLinks(True)
+        view.setHtml(_about_html())
+        layout.addWidget(view)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+
+        dlg.setMinimumWidth(520)
+        dlg.exec()
 
 
 def main() -> None:
