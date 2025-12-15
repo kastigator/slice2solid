@@ -5,8 +5,8 @@ import textwrap
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch, Rectangle
 from matplotlib.lines import Line2D
+from matplotlib.patches import FancyArrowPatch, Rectangle
 
 
 def _wrap(text: str, width: int) -> str:
@@ -93,19 +93,6 @@ def _arrow_orth(ax, x1: float, y1: float, x_mid: float, y2: float, x2: float, *,
     )
 
 
-def _arrow_vertical(ax, x: float, y1: float, y2: float, *, lw: float = 1.2) -> None:
-    ax.add_patch(
-        FancyArrowPatch(
-            (x, y1),
-            (x, y2),
-            arrowstyle="->",
-            mutation_scale=14,
-            linewidth=lw,
-            color="#2F2F2F",
-        )
-    )
-
-
 def generate(out_dir: Path) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_svg = out_dir / "fig_A_information_flow.svg"
@@ -150,7 +137,7 @@ def generate(out_dir: Path) -> tuple[Path, Path]:
         0.26,
         0.20,
         "Экспорт траекторий печати (*.txt)",
-        "Insight → Toolpaths → Simulation data export\nПоля: X, Y, Z; тип траектории; площадь сечения и др.",
+        "Insight → Toolpaths → Simulation data export\nПоля: X, Y, Z; Type/BeadMode; Bead Area и др.",
         fc="#EEF6FF",
         wrap_width=34,
         title_center=True,
@@ -198,17 +185,18 @@ def generate(out_dir: Path) -> tuple[Path, Path]:
     _box(
         ax,
         0.69,
-        0.62,
+        0.60,
         0.28,
-        0.26,
+        0.28,
         "Выходные файлы slice2solid",
-        "preview_structure.stl — сеточная модель структуры\n"
+        "*_s2s_preview_structure.stl — сеточная модель структуры\n"
+        "(опц.) *_s2s_preview_structure.ply, ntop_points.csv, ntop_recipe.txt\n"
         "ansys_layers.json / ansys_layers.csv — таблица ориентаций\n"
         "ansys_mechanical_import_layers.py — импорт в ANSYS Mechanical\n"
         "metadata.json — параметры и статистика обработки",
         fc="#FFF5E6",
-        wrap_width=48,
-        body_fs=10.2,
+        wrap_width=50,
+        body_fs=9.6,
         title_center=True,
     )
 
@@ -256,13 +244,12 @@ def generate(out_dir: Path) -> tuple[Path, Path]:
     _arrow_orth(ax, 0.64, 0.45, bus_x, 0.68, out_left_x)
 
     # Outputs -> branches
-    # CAD branch: direct vertical connector between boxes (no overlap with text).
-    _arrow(ax, 0.83, 0.62, 0.83, 0.53)
+    _arrow(ax, 0.83, 0.60, 0.83, 0.53)
 
     # CAE branch: route from the RIGHT side of outputs, go down along the outer margin,
     # then enter the CAE box from the right (as in the markup).
     outputs_right_x = 0.97
-    outputs_mid_y = 0.62 + 0.26 * 0.5  # center of outputs box
+    outputs_mid_y = 0.60 + 0.28 * 0.5  # center of outputs box
     cae_right_x = 0.97
     cae_enter_y = 0.08 + 0.20 * 0.5  # center of CAE box
     outer_x = 0.995  # just outside the right edge of boxes
@@ -276,7 +263,6 @@ def generate(out_dir: Path) -> tuple[Path, Path]:
             solid_capstyle="round",
         )
     )
-    # Final segment with arrow head pointing left into the CAE box.
     ax.add_patch(
         FancyArrowPatch(
             (outer_x, cae_enter_y),
@@ -304,3 +290,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
