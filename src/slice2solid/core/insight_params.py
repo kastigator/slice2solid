@@ -93,8 +93,11 @@ def infer_stl_path_from_job(job_dir: str | Path) -> Path | None:
 def _parse_float(v: str | None) -> float | None:
     if v is None:
         return None
+    s = v.strip()
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
     try:
-        return float(v.strip())
+        return float(s)
     except ValueError:
         return None
 
@@ -174,3 +177,79 @@ def estimate_bead_width_mm(
         return None
 
     return max(widths_in_params) * k
+
+
+@dataclasses.dataclass(frozen=True)
+class ToolpathThresholdsMm:
+    length_scale_mm_per_param_unit: float
+    min_air_travel_mm: float | None
+    min_path_length_mm: float | None
+    min_raster_length_mm: float | None
+
+
+def estimate_toolpath_thresholds_mm(
+    params: InsightParams,
+    *,
+    sim_slice_height_mm: float | None,
+) -> ToolpathThresholdsMm:
+    """
+    Extracts travel/segment thresholds from toolpathParams and converts them to mm.
+
+    Insight parameter snapshots commonly store lengths in inches even when STL units are mm.
+    We infer the length scale using slice height from params vs the simulation export slice height (mm).
+    """
+    slice_h_params = _parse_float(params.slice_params.get("sliceHeight"))
+    k = infer_params_length_scale(params_slice_height=slice_h_params, sim_slice_height_mm=sim_slice_height_mm) or 25.4
+
+    tp = params.toolpath_params
+
+    def pick_max_mm(keys: tuple[str, ...]) -> float | None:
+        vals: list[float] = []
+        for key in keys:
+            v = _parse_float(tp.get(key))
+            if v is not None and v > 0:
+                vals.append(float(v) * float(k))
+        return max(vals) if vals else None
+
+    min_air = pick_max_mm(("minAirTravel", "main:material:minAirTravel", "alt:material:minAirTravel"))
+    min_path = pick_max_mm(("minPathLength", "main:minPathLength", "alt:minPathLength"))
+    min_raster = pick_max_mm(("minRasterLength", "main:minRasterLength", "alt:minRasterLength"))
+
+    return ToolpathThresholdsMm(
+        length_scale_mm_per_param_unit=float(k),
+        min_air_travel_mm=min_air,
+        min_path_length_mm=min_path,
+        min_raster_length_mm=min_raster,
+    )
+
+
+def estimate_auto_max_jump_mm(
+    *,
+    header_segment_filter_length_mm: float | None,
+    bead_width_mm: float | None,
+    thresholds_mm: ToolpathThresholdsMm | None,
+    fallback_mm: float = 0.508 * 3.0,
+) -> float:
+    """
+    Computes an automatic 'max_jump' threshold for breaking toolpath chains / ignoring long travel segments.
+
+    The tool already treats points with Factor<=0 or BeadArea<=0 as travel; this threshold is an additional
+    safety net for unusually long segments that would otherwise connect distant regions.
+    """
+    candidates: list[float] = []
+
+    if header_segment_filter_length_mm is not None and float(header_segment_filter_length_mm) > 0:
+        candidates.append(3.0 * float(header_segment_filter_length_mm))
+
+    if bead_width_mm is not None and float(bead_width_mm) > 0:
+        candidates.append(3.0 * float(bead_width_mm))
+
+    if thresholds_mm is not None:
+        for v in (thresholds_mm.min_air_travel_mm, thresholds_mm.min_path_length_mm):
+            if v is not None and float(v) > 0:
+                candidates.append(2.0 * float(v))
+
+    candidates.append(float(fallback_mm))
+
+    # Clamp to a sane minimum.
+    return max(1.0, max(candidates))

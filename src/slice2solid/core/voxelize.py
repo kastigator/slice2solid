@@ -43,6 +43,8 @@ def voxelize_toolpath(
     max_radius_mm: float | None = None,
     max_jump_mm: float | None = None,
     min_component_voxels: int = 0,
+    ignore_zero_factor: bool = True,
+    ignore_zero_bead_area: bool = True,
 ) -> VoxelizationResult:
     """
     Builds a voxel occupancy grid by sweeping spheres along toolpath segments.
@@ -72,6 +74,18 @@ def voxelize_toolpath(
 
     for pt in points:
         if pt.type != type_filter:
+            prev_xyz = None
+            prev_area = None
+            prev_type = None
+            continue
+
+        if ignore_zero_factor and float(pt.factor) <= 1e-12:
+            prev_xyz = None
+            prev_area = None
+            prev_type = None
+            continue
+
+        if ignore_zero_bead_area and float(pt.bead_area) <= 1e-12:
             prev_xyz = None
             prev_area = None
             prev_type = None

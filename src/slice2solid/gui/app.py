@@ -28,10 +28,16 @@ except Exception:  # pragma: no cover
 from slice2solid.core.insight_simulation import (
     invert_rowvec_matrix,
     read_simulation_export,
-    transform_points_rowvec,
+    transform_toolpath_points_rowvec,
 )
-from slice2solid.core.insight_params import estimate_bead_width_mm, infer_stl_path_from_job, load_job_params
-from slice2solid.core.cae_orientation import compute_layer_orientations
+from slice2solid.core.insight_params import (
+    estimate_auto_max_jump_mm,
+    estimate_bead_width_mm,
+    estimate_toolpath_thresholds_mm,
+    infer_stl_path_from_job,
+    load_job_params,
+)
+from slice2solid.core.cae_orientation import compute_layer_orientations_toolpath
 from slice2solid.core.ntop_bundle import export_voxel_centers_csv
 from slice2solid.core.voxelize import mesh_from_voxels_configured, voxelize_toolpath
 from slice2solid.app_info import APP_DISPLAY_NAME, AUTHOR, CONTACT_EMAIL, DEPARTMENT, ORGANIZATION, VERSION
@@ -75,6 +81,8 @@ class Worker(QtCore.QObject):
         try:
             t0 = time.time()
             sim_header, rows_iter = read_simulation_export(self.cfg.simulation_txt)
+            for w in sim_header.validation_warnings():
+                self.log.emit(f"WARNING: {w}")
             slice_h = sim_header.slice_height_mm or 0.254
 
             if not self.cfg.export_cae_layers and not self.cfg.export_geometry_preview:
@@ -88,98 +96,114 @@ class Worker(QtCore.QObject):
             else:
                 bounds_min = None
                 bounds_max = None
+                try:
+                    p_stl = Path(self.cfg.placed_stl) if self.cfg.placed_stl else None
+                    if p_stl is not None and p_stl.exists():
+                        self.log.emit("Загрузка placed STL (только bbox):")
+                        _m = trimesh.load_mesh(str(p_stl), force="mesh")
+                        bounds_min = _m.bounds[0]
+                        bounds_max = _m.bounds[1]
+                except Exception:
+                    bounds_min = None
+                    bounds_max = None
 
             self.log.emit("Подготовка преобразования координат (CMB → placed STL)…")
             stl_to_cmb = sim_header.stl_to_cmb
             cmb_to_stl = invert_rowvec_matrix(stl_to_cmb)
 
-            self.log.emit("Чтение точек траектории (Type=1)…")
-            # Transform on the fly: we will buffer points to transform in chunks for speed.
-            buffer_xyz: list[list[float]] = []
-            buffer_area: list[float] = []
-            buffer_time: list[float] = []
-            buffer_factor: list[float] = []
-            buffer_type: list[int] = []
-            buffer_mode: list[int] = []
-
-            transformed_points = []
             total = 0
             kept = 0
-            chunk_size = 200_000
+            counted = False
 
-            def flush() -> None:
-                nonlocal transformed_points, kept
-                if not buffer_xyz:
+            def _count_points(points):
+                nonlocal total, kept
+                for p in points:
+                    total += 1
+                    if p.type == 1:
+                        kept += 1
+                    yield p
+
+            bbox_min = np.array([np.inf, np.inf, np.inf], dtype=float)
+            bbox_max = np.array([-np.inf, -np.inf, -np.inf], dtype=float)
+            bbox_count = 0
+
+            def _track_bbox(points):
+                nonlocal bbox_min, bbox_max, bbox_count
+                for p in points:
+                    if p.type == 1 and float(p.factor) > 0 and float(p.bead_area) > 0:
+                        bbox_min[0] = min(float(bbox_min[0]), float(p.x))
+                        bbox_min[1] = min(float(bbox_min[1]), float(p.y))
+                        bbox_min[2] = min(float(bbox_min[2]), float(p.z))
+                        bbox_max[0] = max(float(bbox_max[0]), float(p.x))
+                        bbox_max[1] = max(float(bbox_max[1]), float(p.y))
+                        bbox_max[2] = max(float(bbox_max[2]), float(p.z))
+                        bbox_count += 1
+                    yield p
+
+            def _check_bbox_against_stl() -> None:
+                if bounds_min is None or bounds_max is None:
                     return
-                arr = np.array(buffer_xyz, dtype=float)
-                out = transform_points_rowvec(arr, cmb_to_stl)
-                for i in range(out.shape[0]):
-                    transformed_points.append(
-                        (
-                            float(out[i, 0]),
-                            float(out[i, 1]),
-                            float(out[i, 2]),
-                            float(buffer_time[i]),
-                            float(buffer_area[i]),
-                            float(buffer_factor[i]),
-                            int(buffer_type[i]),
-                            int(buffer_mode[i]),
-                        )
-                    )
-                kept += out.shape[0]
-                buffer_xyz.clear()
-                buffer_area.clear()
-                buffer_time.clear()
-                buffer_factor.clear()
-                buffer_type.clear()
-                buffer_mode.clear()
+                if not np.isfinite(bbox_min).all() or not np.isfinite(bbox_max).all() or bbox_count <= 0:
+                    return
 
-            for pt in rows_iter:
-                total += 1
-                if pt.type != 1:
-                    continue
-                buffer_xyz.append([pt.x, pt.y, pt.z])
-                buffer_time.append(pt.time_s)
-                buffer_area.append(pt.bead_area)
-                buffer_factor.append(pt.factor)
-                buffer_type.append(pt.type)
-                buffer_mode.append(pt.bead_mode)
+                stl_min = bounds_min.astype(float)
+                stl_max = bounds_max.astype(float)
+                diag = float(np.linalg.norm(stl_max - stl_min))
+                tol = max(1.0, 2.0 * float(slice_h), 0.02 * diag)
+                err = max(10.0, 10.0 * tol)
 
-                if len(buffer_xyz) >= chunk_size:
-                    flush()
-                    self.progress.emit(min(30, int(30 * kept / max(kept, 1))))
+                exceed_low = stl_min - bbox_min
+                exceed_high = bbox_max - stl_max
+                exceed = np.maximum(exceed_low, exceed_high)
+                max_exceed = float(np.max(exceed))
 
-            flush()
+                if max_exceed <= tol:
+                    return
 
-            self.log.emit(f"Type=1 points: {kept} (from {total} rows).")
-
-            if self.cfg.export_cae_layers and kept >= 2:
-                self.log.emit("Computing per-layer print orientation (CAE export)…")
-                arr_xyz = np.array([[p[0], p[1], p[2]] for p in transformed_points], dtype=float)
-                areas = np.array([p[4] for p in transformed_points], dtype=float)
-                z0 = float(np.min(arr_xyz[:, 2])) if arr_xyz.size else 0.0
-                layers = compute_layer_orientations(
-                    arr_xyz,
-                    slice_height_mm=float(slice_h),
-                    z0_mm=z0,
-                    max_jump_mm=self.cfg.max_jump_mm,
-                    weights=areas,
+                msg = (
+                    "Toolpath bbox (CMB→STL) does not match placed STL bounds "
+                    f"(max exceed {max_exceed:.3f} mm, tol {tol:.3f} mm). "
+                    "Likely wrong transform / units / shrink."
                 )
-            else:
-                layers = []
+                if max_exceed >= err:
+                    raise ValueError(msg)
+                self.log.emit(f"WARNING: {msg}")
+
+            layers = []
+            z0 = None
+
+            if self.cfg.export_cae_layers:
+                if bounds_min is not None:
+                    z0 = float(bounds_min[2])
+                else:
+                    self.log.emit("Сканирование Z0 (min Z) для CAE…")
+                    z0_val = None
+                    for pt in _count_points(_track_bbox(transform_toolpath_points_rowvec(rows_iter, cmb_to_stl))):
+                        if pt.type != 1:
+                            continue
+                        z0_val = float(pt.z) if z0_val is None else min(z0_val, float(pt.z))
+                    counted = True
+                    z0 = float(z0_val) if z0_val is not None else 0.0
+                    sim_header, rows_iter = read_simulation_export(self.cfg.simulation_txt)
+
+                self.log.emit("Computing per-layer print orientation (CAE export)…")
+                pts = _track_bbox(transform_toolpath_points_rowvec(rows_iter, cmb_to_stl))
+                if bounds_min is None and not counted:
+                    pts = _count_points(pts)
+                    counted = True
+                layers = compute_layer_orientations_toolpath(
+                    pts,
+                    slice_height_mm=float(slice_h),
+                    z0_mm=float(z0),
+                    max_jump_mm=self.cfg.max_jump_mm,
+                    weight_by_bead_area=True,
+                )
+                _check_bbox_against_stl()
 
             preview_mesh = None
+            mesh_before = None
             vox = None
             if self.cfg.export_geometry_preview:
-                # Build iterable of ToolpathPoint-like tuples for voxelization
-                class _PT:
-                    __slots__ = ("x", "y", "z", "time_s", "bead_area", "factor", "type", "bead_mode")
-
-                    def __init__(self, t):
-                        self.x, self.y, self.z, self.time_s, self.bead_area, self.factor, self.type, self.bead_mode = t
-
-                pts_iter = (_PT(t) for t in transformed_points)
-
                 # Expand bounds slightly to avoid clipping
                 pad = float(self.cfg.max_radius_mm or 0.0) * 2.0
                 bmin = bounds_min - pad
@@ -187,6 +211,9 @@ class Worker(QtCore.QObject):
 
                 self.log.emit("Вокселизация…")
                 self.progress.emit(35)
+                _header2, rows2 = read_simulation_export(self.cfg.simulation_txt)
+                pts_iter = _track_bbox(_count_points(transform_toolpath_points_rowvec(rows2, cmb_to_stl)))
+                counted = True
                 vox = voxelize_toolpath(
                     pts_iter,
                     voxel_size=self.cfg.voxel_size_mm,
@@ -198,6 +225,7 @@ class Worker(QtCore.QObject):
                     max_jump_mm=self.cfg.max_jump_mm,
                     min_component_voxels=self.cfg.min_component_voxels,
                 )
+                _check_bbox_against_stl()
                 self.progress.emit(70)
 
                 self.log.emit("Построение сетки (marching cubes)…")
@@ -273,6 +301,7 @@ class Worker(QtCore.QObject):
             preview_stem = _preview_mesh_stem(self.cfg)
             out_stl = out_dir / f"{preview_stem}.stl"
             out_ply = out_dir / f"{preview_stem}.ply"
+            out_ply_before = out_dir / f"{preview_stem}_before.ply"
             out_recipe = out_dir / "ntop_recipe.txt"
             out_points = out_dir / "ntop_points.csv"
             out_json = out_dir / "metadata.json"
@@ -287,6 +316,13 @@ class Worker(QtCore.QObject):
                 self.log.emit(f"Запись {out_stl}…")
                 preview_mesh.export(out_stl)
                 outputs.append(str(out_stl))
+                try:
+                    if mesh_before is not None:
+                        self.log.emit(f"Запись {out_ply_before}:")
+                        mesh_before.export(out_ply_before)
+                        outputs.append(str(out_ply_before))
+                except Exception:
+                    pass
                 if self.cfg.export_ntop_bundle:
                     try:
                         self.log.emit(f"Запись {out_ply}…")
@@ -320,7 +356,7 @@ class Worker(QtCore.QObject):
                     json.dumps(
                         {
                             "slice_height_mm": float(slice_h),
-                            "z0_mm": float(np.min(arr_xyz[:, 2])) if kept else None,
+                            "z0_mm": float(z0) if z0 is not None else None,
                             "layers": [
                                 {
                                     "layer_id": l.layer_id,
@@ -1228,12 +1264,21 @@ class MeshCompareWidget(QtWidgets.QWidget):
         super().__init__()
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        if pv is not None and QtInteractor is not None:
-            view_cls = _MeshVTKView
-        elif gl is not None:
-            view_cls = _Mesh3DView
-        else:
+        backend = os.environ.get("S2S_PREVIEW_BACKEND", "auto").strip().lower()
+        if backend == "vtk":
+            view_cls = _MeshVTKView if (pv is not None and QtInteractor is not None) else _Mesh2DView
+        elif backend == "gl":
+            view_cls = _Mesh3DView if gl is not None else _Mesh2DView
+        elif backend == "2d":
             view_cls = _Mesh2DView
+        else:
+            # Default to pyqtgraph OpenGL when available: it's typically more robust than VTK in Qt layouts.
+            if gl is not None:
+                view_cls = _Mesh3DView
+            elif pv is not None and QtInteractor is not None:
+                view_cls = _MeshVTKView
+            else:
+                view_cls = _Mesh2DView
         self.before = view_cls(title="До (после marching cubes)")
         self.after = view_cls(title="После (после сглаживания)")
         layout.addWidget(self.before, 1)
@@ -1416,6 +1461,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
 
+        main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        main_splitter.setChildrenCollapsible(False)
+        layout.addWidget(main_splitter, 1)
+
+        scrollbar_css = """
+            QScrollBar:vertical { width: 14px; }
+            QScrollBar:horizontal { height: 14px; }
+            QScrollBar::handle { min-height: 28px; min-width: 28px; background: #9A9A9A; border-radius: 6px; }
+            QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; }
+            QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+        """
+
+        top_panel = QtWidgets.QWidget()
+        top_layout = QtWidgets.QVBoxLayout(top_panel)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        main_splitter.addWidget(top_panel)
+
         header = QtWidgets.QLabel(
             "Цель: получить `*_s2s_preview_structure.stl`, который открывается в nTop и "
             "дальше конвертируется в solid/STEP средствами nTop.\n"
@@ -1424,11 +1486,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "Пайплайн: Import Mesh → Implicit Body from Mesh → (Smooth/Close/Repair) → Convert to CAD/Solid → Export STEP."
         )
         header.setWordWrap(True)
-        layout.addWidget(header)
+        top_layout.addWidget(header)
 
-        io_group = QtWidgets.QGroupBox("Шаг 1 — Входные файлы")
+        io_group = QtWidgets.QGroupBox("Шаг 1 - Входные файлы")
         io_form = QtWidgets.QFormLayout(io_group)
-        layout.addWidget(io_group)
+        top_layout.addWidget(io_group)
 
         self.sim_edit = QtWidgets.QLineEdit()
         self.sim_edit.setPlaceholderText(r"Например: ...\part-table-simulation-data.txt")
@@ -1485,12 +1547,26 @@ class MainWindow(QtWidgets.QMainWindow):
         io_form.addRow("Папка результата:", out_row)
 
         tabs = QtWidgets.QTabWidget()
-        layout.addWidget(tabs, 1)
+        top_layout.addWidget(tabs, 1)
 
         # --- Tab: nTop / Geometry preview ---
         geometry_tab = QtWidgets.QWidget()
         tabs.addTab(geometry_tab, "nTop / Геометрия")
-        geo_layout = QtWidgets.QVBoxLayout(geometry_tab)
+        geo_outer = QtWidgets.QVBoxLayout(geometry_tab)
+        geo_outer.setContentsMargins(0, 0, 0, 0)
+
+        geo_scroll = QtWidgets.QScrollArea()
+        geo_scroll.setWidgetResizable(True)
+        geo_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        geo_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        geo_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        geo_scroll.setStyleSheet(scrollbar_css)
+        geo_outer.addWidget(geo_scroll, 1)
+
+        geo_scroll_content = QtWidgets.QWidget()
+        geo_scroll.setWidget(geo_scroll_content)
+        geo_layout = QtWidgets.QVBoxLayout(geo_scroll_content)
+        geo_layout.setContentsMargins(0, 0, 0, 0)
 
         geo_intro = QtWidgets.QLabel(
             "Режим nTop: восстановление внутренней структуры и экспорт `*_s2s_preview_structure.stl`.\n"
@@ -1696,17 +1772,43 @@ class MainWindow(QtWidgets.QMainWindow):
         prev_hint = QtWidgets.QLabel(
             "Просмотр результата последнего запуска.\n"
             "Слева: сетка сразу после marching cubes. Справа: после сглаживания.\n"
-            "Если сетка слишком большая, для предпросмотра она автоматически прореживается."
+            "Если сетка слишком большая, для предпросмотра она автоматически прореживается.\n"
+            "После закрытия программы можно заново загрузить meshes из папки результата."
         )
         prev_hint.setWordWrap(True)
         prev_layout.addWidget(prev_hint, 0)
+        prev_btn_row = QtWidgets.QHBoxLayout()
+        prev_layout.addLayout(prev_btn_row)
+        self.preview_reload_btn = QtWidgets.QPushButton("Загрузить из папки результата")
+        self.preview_open_after_btn = QtWidgets.QPushButton("Открыть mesh (после)")
+        self.preview_open_before_btn = QtWidgets.QPushButton("Открыть mesh (до)")
+        self.preview_open_folder_btn = QtWidgets.QPushButton("Открыть папку результата")
+        prev_btn_row.addWidget(self.preview_reload_btn)
+        prev_btn_row.addStretch(1)
+        prev_btn_row.addWidget(self.preview_open_before_btn)
+        prev_btn_row.addWidget(self.preview_open_after_btn)
+        prev_btn_row.addWidget(self.preview_open_folder_btn)
         self.mesh_preview = MeshCompareWidget()
         prev_layout.addWidget(self.mesh_preview, 1)
 
         # --- Tab: ANSYS / CAE ---
         ansys_tab = QtWidgets.QWidget()
         tabs.addTab(ansys_tab, "ANSYS / CAE")
-        ansys_layout = QtWidgets.QVBoxLayout(ansys_tab)
+        ansys_outer = QtWidgets.QVBoxLayout(ansys_tab)
+        ansys_outer.setContentsMargins(0, 0, 0, 0)
+
+        ansys_scroll = QtWidgets.QScrollArea()
+        ansys_scroll.setWidgetResizable(True)
+        ansys_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        ansys_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        ansys_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        ansys_scroll.setStyleSheet(scrollbar_css)
+        ansys_outer.addWidget(ansys_scroll, 1)
+
+        ansys_scroll_content = QtWidgets.QWidget()
+        ansys_scroll.setWidget(ansys_scroll_content)
+        ansys_layout = QtWidgets.QVBoxLayout(ansys_scroll_content)
+        ansys_layout.setContentsMargins(0, 0, 0, 0)
 
         ansys_intro = QtWidgets.QLabel(
             "Режим ANSYS: экспорт ориентации печати по слоям для назначения ортотропии в Mechanical.\n"
@@ -1830,18 +1932,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.help_view.setHtml(_HELP_HTML)
         help_layout.addWidget(self.help_view, 1)
 
-        # --- Run + Outputs ---
+        # --- Run + Outputs (compact bottom panel) ---
+        bottom_panel = QtWidgets.QWidget()
+        bottom_layout = QtWidgets.QVBoxLayout(bottom_panel)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        main_splitter.addWidget(bottom_panel)
+
         self.run_btn = QtWidgets.QPushButton("Запуск")
         self.run_btn.setMinimumHeight(36)
-        layout.addWidget(self.run_btn)
+        bottom_layout.addWidget(self.run_btn)
 
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
-        layout.addWidget(self.progress)
+        bottom_layout.addWidget(self.progress)
 
-        outputs_group = QtWidgets.QGroupBox("Результаты")
-        out_layout = QtWidgets.QVBoxLayout(outputs_group)
-        layout.addWidget(outputs_group)
+        bottom_tabs = QtWidgets.QTabWidget()
+        bottom_layout.addWidget(bottom_tabs, 1)
+
+        results_tab = QtWidgets.QWidget()
+        bottom_tabs.addTab(results_tab, "Результаты")
+        out_layout = QtWidgets.QVBoxLayout(results_tab)
 
         self.outputs_list = QtWidgets.QListWidget()
         out_layout.addWidget(self.outputs_list, 1)
@@ -1859,13 +1969,24 @@ class MainWindow(QtWidgets.QMainWindow):
         out_btn_row.addStretch(1)
         out_btn_row.addWidget(self.open_out_btn)
 
+        log_tab = QtWidgets.QWidget()
+        bottom_tabs.addTab(log_tab, "Лог")
+        log_layout = QtWidgets.QVBoxLayout(log_tab)
         self.log_box = QtWidgets.QPlainTextEdit()
         self.log_box.setReadOnly(True)
-        layout.addWidget(self.log_box, 1)
+        log_layout.addWidget(self.log_box, 1)
+
+        # Prefer the upper area visually; keep bottom compact but resizable by dragging the splitter.
+        main_splitter.setStretchFactor(0, 5)
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setSizes([1000, 260])
 
         self.thread: QtCore.QThread | None = None
         self.worker: Worker | None = None
         self._last_outputs: list[str] = []
+        self._preview_before_path: str | None = None
+        self._preview_after_path: str | None = None
+        self._settings = QtCore.QSettings()
 
         self.sim_btn.clicked.connect(self._pick_sim)
         self.job_btn.clicked.connect(self._pick_job)
@@ -1894,6 +2015,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_ansys_preset_btn.clicked.connect(self._apply_selected_ansys_preset)
         self.about_btn.clicked.connect(self._show_about)
         self.howto_btn.clicked.connect(self._show_help)
+        self.preview_open_folder_btn.clicked.connect(self._open_output_folder)
+        self.preview_reload_btn.clicked.connect(self._load_last_run_from_output_dir)
+        self.preview_open_after_btn.clicked.connect(self._open_preview_after)
+        self.preview_open_before_btn.clicked.connect(self._open_preview_before)
+        self.out_edit.editingFinished.connect(self._load_last_run_from_output_dir)
 
         # If user edits any parameter manually -> switch preset to Custom.
         for w in (
@@ -1912,6 +2038,141 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for w in (self.ansys_min_conf, self.ansys_group_layers, self.ansys_create_ns, self.ansys_create_cs):
             self._connect_any_change(w, self._mark_ansys_preset_custom)
+
+        self._restore_settings()
+        self._update_preview_buttons()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        try:
+            self._settings.setValue("window/geometry", self.saveGeometry())
+            self._settings.setValue("window/state", self.saveState())
+            self._settings.setValue("paths/sim", self.sim_edit.text().strip())
+            self._settings.setValue("paths/job", self.job_edit.text().strip())
+            self._settings.setValue("paths/stl", self.stl_edit.text().strip())
+            self._settings.setValue("paths/out", self.out_edit.text().strip())
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def _restore_settings(self) -> None:
+        try:
+            geo = self._settings.value("window/geometry", None)
+            state = self._settings.value("window/state", None)
+            if isinstance(geo, QtCore.QByteArray):
+                self.restoreGeometry(geo)
+            if isinstance(state, QtCore.QByteArray):
+                self.restoreState(state)
+
+            sim = self._settings.value("paths/sim", "", type=str) or ""
+            job = self._settings.value("paths/job", "", type=str) or ""
+            stl = self._settings.value("paths/stl", "", type=str) or ""
+            out = self._settings.value("paths/out", "", type=str) or ""
+
+            if sim and not self.sim_edit.text().strip():
+                self.sim_edit.setText(sim)
+            if job and not self.job_edit.text().strip():
+                self.job_edit.setText(job)
+            if stl and not self.stl_edit.text().strip():
+                self.stl_edit.setText(stl)
+            if out and not self.out_edit.text().strip():
+                self.out_edit.setText(out)
+        except Exception:
+            return
+        self._load_last_run_from_output_dir()
+
+    def _update_preview_buttons(self) -> None:
+        self.preview_open_before_btn.setEnabled(bool(self._preview_before_path))
+        self.preview_open_after_btn.setEnabled(bool(self._preview_after_path))
+
+    def _open_preview_after(self) -> None:
+        if not self._preview_after_path:
+            return
+        try:
+            os.startfile(self._preview_after_path)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def _open_preview_before(self) -> None:
+        if not self._preview_before_path:
+            return
+        try:
+            os.startfile(self._preview_before_path)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def _load_last_run_from_output_dir(self) -> None:
+        out = self.out_edit.text().strip()
+        if not out:
+            return
+        out_dir = Path(out)
+        meta_path = out_dir / "metadata.json"
+        if not meta_path.exists():
+            return
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        outputs = meta.get("outputs")
+        if isinstance(outputs, list):
+            try:
+                self._set_outputs([str(x) for x in outputs])
+            except Exception:
+                pass
+
+        before_path = None
+        after_path = None
+        if isinstance(outputs, list):
+            for x in outputs:
+                p = str(x)
+                pl = p.lower()
+                if pl.endswith("_before.ply"):
+                    before_path = p
+                if pl.endswith(".ply") and "_before" not in pl and "_s2s_preview_structure" in pl:
+                    after_path = p
+                if pl.endswith(".stl") and "_s2s_preview_structure" in pl and after_path is None:
+                    after_path = p
+
+        if after_path is None:
+            candidates = sorted(
+                out_dir.glob("*_s2s_preview_structure*.ply"), key=lambda p: p.stat().st_mtime, reverse=True
+            )
+            if candidates:
+                after_path = str(candidates[0])
+        if before_path is None:
+            candidates = sorted(
+                out_dir.glob("*_s2s_preview_structure*_before.ply"), key=lambda p: p.stat().st_mtime, reverse=True
+            )
+            if candidates:
+                before_path = str(candidates[0])
+
+        self._preview_before_path = before_path
+        self._preview_after_path = after_path
+        self._update_preview_buttons()
+
+        if after_path is None:
+            return
+        try:
+            after_mesh = trimesh.load_mesh(after_path, force="mesh")
+        except Exception:
+            return
+        before_mesh = None
+        if before_path is not None:
+            try:
+                before_mesh = trimesh.load_mesh(before_path, force="mesh")
+            except Exception:
+                before_mesh = None
+        if before_mesh is None:
+            before_mesh = after_mesh
+
+        stats = {
+            "before": {"vertices": int(before_mesh.vertices.shape[0]), "faces": int(before_mesh.faces.shape[0])},
+            "after": {"vertices": int(after_mesh.vertices.shape[0]), "faces": int(after_mesh.faces.shape[0])},
+        }
+        try:
+            self.mesh_preview.set_meshes(before_mesh, after_mesh, stats)
+        except Exception:
+            pass
 
     def _pick_sim(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Выберите экспорт симуляции", "", "Text (*.txt)")
@@ -2230,6 +2491,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.jump_filter.isChecked() or (do_geo and self.auto_radius.isChecked()):
             header, _it = read_simulation_export(sim)
 
+        params = None
+        bead_w: float | None = None
+        thresholds = None
+
         if do_geo:
             if self.auto_radius.isChecked():
                 if not job_dir:
@@ -2254,8 +2519,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # jump threshold: derived from segment filter length when enabled
         if self.jump_filter.isChecked():
-            seg = (header.segment_filter_length_mm if header else None) or 0.508
-            max_jump = 3.0 * float(seg)
+            seg = (header.segment_filter_length_mm if header else None)
+            if job_dir and params is None:
+                try:
+                    params = load_job_params(job_dir)
+                except Exception:
+                    params = None
+
+            if params is not None and bead_w is None:
+                bead_w = estimate_bead_width_mm(params, sim_slice_height_mm=header.slice_height_mm if header else None)
+
+            if params is not None:
+                thresholds = estimate_toolpath_thresholds_mm(params, sim_slice_height_mm=header.slice_height_mm if header else None)
+
+            max_jump = estimate_auto_max_jump_mm(
+                header_segment_filter_length_mm=seg,
+                bead_width_mm=bead_w,
+                thresholds_mm=thresholds,
+                fallback_mm=3.0 * float((seg or 0.508)),
+            )
             if max_r is not None:
                 max_jump = max(float(max_jump), 3.0 * float(max_r))
         else:
@@ -2321,6 +2603,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if isinstance(outputs, list):
             self._set_outputs([str(x) for x in outputs])
+            self._load_last_run_from_output_dir()
         self.open_out_btn.setEnabled(True)
 
     def _show_about(self) -> None:
@@ -2365,6 +2648,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main() -> None:
     app = QtWidgets.QApplication([])
+    try:
+        app.setOrganizationName(ORGANIZATION or "slice2solid")
+        app.setApplicationName(APP_DISPLAY_NAME or "slice2solid")
+    except Exception:
+        pass
     w = MainWindow()
     w.show()
     app.exec()

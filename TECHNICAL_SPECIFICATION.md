@@ -130,6 +130,38 @@ volume introduced additional `BeadMode` values (e.g., `200`/`202`/`205`/...).
 
 ---
 
+### 4.6 Simulation Data Header: Metadata and Validation
+
+In the simulation export (e.g., `*-simulation-data.txt`), the `Toolpath Simulation Data` header block appears before the table,
+containing `Key : Value` lines and an `STL to CMB transformation matrix` section.
+This header is used for auto-configuration, validation, and reporting.
+
+**Normative fields (used by algorithms/validation):**
+- `Slice height` (mm) — layer height used for grouping toolpath into layers.
+- `Segment filter length` (mm) — characteristic segmentation length; used as a hint for travel/jump filtering.
+- `STL to CMB transformation matrix` — maps the toolpath table coordinates (CMB) to the placed STL coordinate system.
+- `Model *-shrink` / `Support *-shrink` — per-axis shrink factors used for diagnostics and matrix consistency checks.
+
+**Informative fields (reporting/presets):**
+- `Version`, `Insight version`, `Modeler type`, `Build mode`, `STL units`, materials/tips.
+
+**Correctness checks:**
+- matrix must be 4×4 with finite values and `M[3,3] ≈ 1`;
+- Insight convention uses *row-vectors* and stores translation in the last row (translation in the last column is a warning);
+- if the matrix is close to diagonal scaling, its scale should be consistent with `Model *-shrink` (within tolerances);
+- after `CMB -> placed STL`, toolpath points must lie within (or near) the placed STL bounds (with tolerance).
+
+**Smart travel/jump handling:**
+- segments with `Factor <= 0` or `Bead Area <= 0` are treated as non-deposition travel and are ignored for orientation computation
+  and material voxelization;
+- if an explicit `max_jump` threshold is used, it should be derived from `Segment filter length`, bead width estimates, and robust
+  segment-length statistics (median/quantiles).
+
+**Parsing robustness:**
+- implementations must handle locales where decimals may use a comma instead of a dot.
+
+---
+
 ## 5. Coordinate Systems and Transformations
 
 The following coordinate systems are involved:

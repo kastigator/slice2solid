@@ -59,12 +59,27 @@ The project uses a **dual-representation approach**:
 3. Import STL into Stratasys Insight
 4. Orient part on build plate and save *placed STL*
 5. Perform slicing
-6. Export toolpath simulation data
+6. Export toolpath simulation data (`*-simulation-data.txt`)
 7. Use `slice2solid` to:
    - generate CAE-ready representation
    - map toolpath-based material orientations
 8. Perform structural analysis in ANSYS
 9. (Optional) Reconstruct explicit infill geometry
+
+---
+
+## Inputs
+
+Minimum required:
+- Insight toolpath simulation export (text), e.g. `*-simulation-data.txt` (contains the `Toolpath Simulation Data` header block, `STL to CMB` matrix, and the toolpath table)
+- placed STL exported from Insight (required for geometry export/preview)
+
+Optional (recommended for better defaults/metadata):
+- Insight job folder `ssys_*` containing `sliceParams.*`, `toolpathParams.*`, `supportParams.*` and related artifacts
+
+Notes:
+- The simulation export header is used for `Slice height`, `Segment filter length`, shrink factors, and matrix validation.
+- Locale robustness: some exports may use a comma decimal separator.
 
 ---
 
