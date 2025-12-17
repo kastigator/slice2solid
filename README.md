@@ -95,3 +95,37 @@ slice2solid/
 ├─ data/                             # Input/output examples (ignored in git if large)
 ├─ tests/                            # Validation and test cases
 └─ .gitignore
+```
+
+---
+
+## Mesh Healer (CAD Mesh Import)
+
+slice2solid can optionally run a **safe mesh repair** step after exporting the preview STL, producing `*_healed.stl`.
+The goal is to improve import success in CAD systems that support mesh bodies (watertight/manifold as much as possible), while avoiding remeshing/simplification that could destroy infill details.
+
+### GUI (recommended)
+
+- Open the **`CAD / Геометрия`** tab
+- Enable **`Mesh Healer (CAD)`**
+- Preset: `safe` (default) or `aggressive`
+- Optional: enable JSON report to get before/after stats in a file next to the output STL
+
+Output files in the chosen output folder:
+- `*_s2s_preview_structure.stl` (original)
+- `*_s2s_preview_structure_healed.stl` (repaired)
+- `*_s2s_preview_structure_healed_report.json` (optional)
+
+### CLI (standalone heal)
+
+Run from repo root:
+- `python run_cli.py heal data/samples/smoke_preview_structure.stl --heal-preset safe --close-holes-max 2.0 --report heal_report.json`
+
+### Backend notes
+
+- Primary backend: `pymeshlab` (recommended; installed via `pip install pymeshlab`)
+- Fallback: `meshlabserver` (MeshLab CLI). An example filter script template is in `tools/meshlab/heal_safe_template.mlx`.
+
+### Smoke test
+
+- `python -m unittest discover -s tests -p "test_*.py"`

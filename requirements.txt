@@ -12,3 +12,4 @@ pyvista
 pyvistaqt
 qtpy
 python-docx
+pymeshlab

@@ -190,7 +190,7 @@ def generate(out_dir: Path) -> tuple[Path, Path]:
         0.28,
         "Выходные файлы slice2solid",
         "*_s2s_preview_structure.stl — сеточная модель структуры\n"
-        "(опц.) *_s2s_preview_structure.ply, ntop_points.csv, ntop_recipe.txt\n"
+        "(опц.) *_s2s_preview_structure_mesh.ply, voxel_points.csv, cad_import_notes.txt\n"
         "ansys_layers.json / ansys_layers.csv — таблица ориентаций\n"
         "ansys_mechanical_import_layers.py — импорт в ANSYS Mechanical\n"
         "metadata.json — параметры и статистика обработки",
@@ -208,9 +208,9 @@ def generate(out_dir: Path) -> tuple[Path, Path]:
         0.28,
         0.20,
         "CAD-ветвь",
-        "Конвертация сетки в твердое тело (nTop или альтернативы)\n"
+        "Конвертация сетки в твердое тело (внешний CAD/mesh-инструмент)\n"
         "→ экспорт Parasolid (*.x_t) или STEP (*.stp)\n"
-        "→ импорт в SolidWorks",
+        "→ импорт в CAD (mesh)",
         fc="#FFF5E6",
         wrap_width=44,
         title_center=True,
@@ -290,4 +290,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

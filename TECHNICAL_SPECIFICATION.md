@@ -277,20 +277,62 @@ This mode is intended for:
 
 ---
 
-### 11.1 nTop (nTopology) Workflow (Recommended for Solid Conversion)
+### 11.1 Converting the Output to a CAD Solid (STEP) Using External Tools
 
-Direct conversion of voxel/infill geometry into a valid B-Rep solid (STEP) can be computationally expensive and unstable.
-Therefore, the recommended workflow for generating a CAD-ready solid with internal voids is:
+Direct conversion of porous/voxel/infill geometry into a valid B-Rep solid (STEP) can be computationally expensive and unstable, especially with fine internal features.
+Therefore, conversion to a “true” CAD solid is treated as a responsibility of an external CAD/mesh tool, while slice2solid focuses on producing correct and portable interchange data.
 
-1. Reconstruct a volumetric representation of the printed material from `Type = 1` toolpaths (model only).
-2. Export the volume as a volumetric field file suitable for nTop (recommended: **OpenVDB**).
-3. Convert the volumetric field into a solid inside nTop using its internal tools (isosurface/solidification/repair).
-4. Export the final CAD solid as **STEP** from nTop.
+Recommended tool-agnostic workflow:
+1. Import `*_s2s_preview_structure.stl` (or `.ply`) using `mm` units.
+2. If needed, perform mesh repair (Repair/Close Holes/Orient Normals, remove self-intersections/islands).
+3. If supported, convert mesh/implicit/volume into a solid (B-Rep).
+4. Export `STEP` (or another CAD format).
 
-The project shall therefore provide:
-- `*.vdb` (primary) — volumetric field representing material/void.
-- `*.stl` (optional) — preview mesh generated from the volume.
-- `*.json` — metadata (voxel size, thresholds, source job identifiers, shrink/matrix info, toolpath filtering rules).
+Accordingly, the project shall provide the following universal artifacts:
+- `*_s2s_preview_structure.stl` (primary) — output mesh
+- `*_s2s_preview_structure_mesh.ply` (optional) — alternative mesh format
+- `voxel_points.csv` (optional) — point cloud from occupied voxels (x,y,z; may be sampled)
+- `cad_import_notes.txt` (optional) — import notes and suggested spacing/resolution
+- `metadata.json` — metadata (voxel size, thresholds, sources, shrink/matrix info, toolpath filtering rules)
+
+---
+
+### 11.2 Mesh Healer (CAD mesh) (post-export stage)
+
+For reliable import into CAD systems as a **mesh body**, the exported mesh should be, as much as possible:
+- watertight (closed),
+- coherently oriented (normals/winding),
+- free from common defects (duplicate vertices/faces, null/zero-area faces, unreferenced vertices).
+
+The project shall provide an **optional** automatic mesh repair stage applied **after** the final STL/OBJ/PLY export, without changing the geometry generation logic. Default behavior must be **safe** (no remeshing/simplification) to avoid destroying fine infill features.
+
+**`safe` preset (no remeshing/simplification):**
+- remove duplicate vertices
+- remove duplicate faces
+- remove unreferenced vertices
+- remove null/zero-area faces
+- re-orient faces coherently
+- close small holes with a user limit (`--close-holes-max`, mm)
+
+**`aggressive` preset (explicit opt-in only):**
+- additionally attempts to remove self-intersecting faces
+- may use a slightly larger hole-closing threshold
+
+**Hole-size note:** MeshLab/pymeshlab hole closing is typically limited by **boundary edge count**, not millimeters. Therefore `--close-holes-max` (mm) is interpreted as an “approximate hole diameter” and converted to an edge-count limit using estimated boundary edge length; the conversion is recorded in the JSON report.
+
+**GUI integration:**
+- The `CAD / Geometry` tab contains a `Mesh Healer (CAD)` block:
+  - enable/disable (produces `*_healed.stl` next to the original STL),
+  - preset `safe/aggressive`,
+  - `close_holes_max` (mm),
+  - optional JSON report `*_healed_report.json` (before/after stats).
+
+**CLI (standalone):**
+- `python run_cli.py heal input.stl --heal-preset safe --close-holes-max 2.0 --report heal_report.json`
+
+**Backend:**
+- primary: `pymeshlab` (preferred),
+- fallback: `meshlabserver` (via generated `.mlx`; template example: `tools/meshlab/heal_safe_template.mlx`).
 
 ---
 
@@ -300,7 +342,8 @@ The project generates:
 - CAE-ready solid geometry (STL / STEP),
 - toolpath-derived material orientation data for ANSYS,
 - explicit infill geometry (optional),
-- diagnostic and statistical reports.
+ - diagnostic and statistical reports,
+ - (optional) healed mesh `*_healed.stl` and a before/after JSON report (`*_healed_report.json`).
 
 ---
 

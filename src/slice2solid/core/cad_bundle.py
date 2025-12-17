@@ -26,7 +26,8 @@ def export_voxel_centers_csv(
     """
     Exports occupied voxel centers as a point cloud CSV.
 
-    This is intended as an alternative input for nTop: Point List / Point Cloud → Implicit.
+    This is intended as a generic interchange format for external CAD/mesh tools that
+    can consume a point list / point cloud.
     For large models, the output is randomly sampled to `max_points`.
     """
 

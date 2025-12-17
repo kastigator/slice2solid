@@ -1,0 +1,17 @@
+<!DOCTYPE FilterScript>
+<FilterScript>
+ <filter name="Remove Duplicate Vertices"/>
+ <filter name="Remove Duplicate Faces"/>
+ <filter name="Remove Unreferenced Vertices"/>
+ <filter name="Remove Zero Area Faces"/>
+ <filter name="Re-Orient all faces coherently"/>
+ <filter name="Close Holes">
+  <!-- NOTE: MeshLab's close-holes limit is typically "edge count", not mm. -->
+  <Param type="RichInt" name="maxholesize" value="30"/>
+  <Param type="RichBool" name="selected" value="false"/>
+  <Param type="RichBool" name="newfaceselected" value="true"/>
+  <Param type="RichBool" name="selfintersection" value="true"/>
+  <Param type="RichBool" name="refinehole" value="false"/>
+ </filter>
+</FilterScript>
+

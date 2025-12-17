@@ -38,9 +38,10 @@ from slice2solid.core.insight_params import (
     load_job_params,
 )
 from slice2solid.core.cae_orientation import compute_layer_orientations_toolpath
-from slice2solid.core.ntop_bundle import export_voxel_centers_csv
+from slice2solid.core.cad_bundle import export_voxel_centers_csv
 from slice2solid.core.voxelize import mesh_from_voxels_configured, voxelize_toolpath
 from slice2solid.app_info import APP_DISPLAY_NAME, AUTHOR, CONTACT_EMAIL, DEPARTMENT, ORGANIZATION, VERSION
+from slice2solid.mesh_heal import heal_mesh_file
 
 
 @dataclass
@@ -59,11 +60,17 @@ class JobConfig:
     smooth_iterations: int
     export_cae_layers: bool
     export_geometry_preview: bool
-    export_ntop_bundle: bool = True
+    export_cad_bundle: bool = True
     ansys_min_confidence: float = 0.2
     ansys_group_size_layers: int = 1
     ansys_create_named_selections: bool = True
     ansys_create_coordinate_systems: bool = True
+    heal_enabled: bool = False
+    heal_preset: str = "safe"
+    heal_close_holes_max_mm: float = 2.0
+    heal_report_enabled: bool = False
+    heal_report_path: str | None = None
+    heal_backend: str = "auto"
 
 
 class Worker(QtCore.QObject):
@@ -300,22 +307,48 @@ class Worker(QtCore.QObject):
             # Prefix geometry outputs to reduce confusion with the user-provided "placed STL".
             preview_stem = _preview_mesh_stem(self.cfg)
             out_stl = out_dir / f"{preview_stem}.stl"
-            out_ply = out_dir / f"{preview_stem}.ply"
-            out_ply_before = out_dir / f"{preview_stem}_before.ply"
-            out_recipe = out_dir / "ntop_recipe.txt"
-            out_points = out_dir / "ntop_points.csv"
+            # PLY is an optional CAD-bundle artifact; name it explicitly to avoid confusion with the STL.
+            out_ply = out_dir / f"{preview_stem}_mesh.ply"
+            out_ply_before = out_dir / f"{preview_stem}_mesh_before.ply"
+            out_notes = out_dir / "cad_import_notes.txt"
+            out_points = out_dir / "voxel_points.csv"
             out_json = out_dir / "metadata.json"
             out_layers_json = out_dir / "ansys_layers.json"
             out_layers_csv = out_dir / "ansys_layers.csv"
             out_ansys_script = out_dir / "ansys_mechanical_import_layers.py"
 
             outputs: list[str] = []
-            ntop_written = False
+            bundle_written = False
 
             if self.cfg.export_geometry_preview and preview_mesh is not None:
                 self.log.emit(f"Запись {out_stl}…")
                 preview_mesh.export(out_stl)
                 outputs.append(str(out_stl))
+                if bool(self.cfg.heal_enabled):
+                    try:
+                        healed_stl = out_dir / f"{out_stl.stem}_healed{out_stl.suffix}"
+                        report_path = None
+                        if bool(self.cfg.heal_report_enabled):
+                            if self.cfg.heal_report_path:
+                                report_path = Path(self.cfg.heal_report_path)
+                            else:
+                                report_path = out_dir / f"{out_stl.stem}_healed_report.json"
+                        self.log.emit(
+                            f"Mesh Healer: preset={self.cfg.heal_preset}, close_holes_max={self.cfg.heal_close_holes_max_mm} мм"
+                        )
+                        heal_mesh_file(
+                            out_stl,
+                            out_path=healed_stl,
+                            preset=str(self.cfg.heal_preset),
+                            close_holes_max_mm=float(self.cfg.heal_close_holes_max_mm),
+                            report_path=report_path,
+                            backend=str(self.cfg.heal_backend),
+                        )
+                        outputs.append(str(healed_stl))
+                        if report_path is not None:
+                            outputs.append(str(report_path))
+                    except Exception as e:
+                        self.log.emit(f"WARNING: Mesh Healer failed: {e}")
                 try:
                     if mesh_before is not None:
                         self.log.emit(f"Запись {out_ply_before}:")
@@ -323,15 +356,15 @@ class Worker(QtCore.QObject):
                         outputs.append(str(out_ply_before))
                 except Exception:
                     pass
-                if self.cfg.export_ntop_bundle:
+                if self.cfg.export_cad_bundle:
                     try:
                         self.log.emit(f"Запись {out_ply}…")
                         preview_mesh.export(out_ply)
                         outputs.append(str(out_ply))
 
-                        recipe = _render_ntop_recipe(self.cfg)
-                        out_recipe.write_text(recipe, encoding="utf-8")
-                        outputs.append(str(out_recipe))
+                        notes = _render_cad_import_notes(self.cfg)
+                        out_notes.write_text(notes, encoding="utf-8")
+                        outputs.append(str(out_notes))
 
                         if vox is not None:
                             self.log.emit(f"Запись {out_points}…")
@@ -344,11 +377,11 @@ class Worker(QtCore.QObject):
                                 include_header=False,
                             )
                             note = "sampled" if res.sampled else "all"
-                            self.log.emit(f"nTop точки: {res.points_written:,}/{res.points_total:,} ({note})")
+                            self.log.emit(f"Точки (voxel): {res.points_written:,}/{res.points_total:,} ({note})")
                             outputs.append(str(out_points))
-                        ntop_written = True
+                        bundle_written = True
                     except Exception as e:
-                        self.log.emit(f"nTop bundle пропущен: {e}")
+                        self.log.emit(f"CAD bundle пропущен: {e}")
 
             if self.cfg.export_cae_layers:
                 self.log.emit(f"Запись {out_layers_json}…")
@@ -438,10 +471,8 @@ class Worker(QtCore.QObject):
             if self.cfg.export_cae_layers:
                 extra = f", {out_layers_json.name}, {out_layers_csv.name}, {out_ansys_script.name}"
             if self.cfg.export_geometry_preview:
-                ntop_part = f", {out_ply.name}, {out_recipe.name}" if ntop_written else ""
-                if ntop_written:
-                    ntop_part = f", {out_ply.name}, {out_points.name}, {out_recipe.name}"
-                base = f"{out_stl.name}{ntop_part}, {out_json.name}{extra}"
+                bundle_part = f", {out_ply.name}, {out_notes.name}, {out_points.name}" if bundle_written else ""
+                base = f"{out_stl.name}{bundle_part}, {out_json.name}{extra}"
             else:
                 base = f"{out_json.name}{extra}"
             self.finished.emit(True, f"Готово. Файлы: {base}", outputs)
@@ -509,7 +540,7 @@ def _about_html() -> str:
 
 _ANSYS_MECHANICAL_SCRIPT_TEMPLATE = r'''# slice2solid → ANSYS Mechanical (Workbench) import helper
 #
-# Tested target: ANSYS 2025 R2 (Mechanical scripting).
+# Tested target: ANSYS Mechanical (Workbench) scripting API.
 #
 # This script tries to:
 #   1) Load layer orientation table from ansys_layers.json
@@ -815,7 +846,7 @@ def _preview_mesh_stem(cfg: JobConfig) -> str:
     return f"{part}_vox{vox}{ds_part}_sig{sig}_it{it}_s2s_preview_structure"
 
 
-def _render_ntop_recipe(cfg: JobConfig) -> str:
+def _render_cad_import_notes(cfg: JobConfig) -> str:
     v = float(cfg.voxel_size_mm)
     suggested = max(0.5 * v, 0.02)
     ds = int(getattr(cfg, "meshing_downsample_factor", 1) or 1)
@@ -823,29 +854,28 @@ def _render_ntop_recipe(cfg: JobConfig) -> str:
     suggested_mesh = max(0.5 * v_mesh, 0.02)
     preview_stem = _preview_mesh_stem(cfg)
     return (
-        "slice2solid → nTop: рекомендуемый workflow\n"
+        "slice2solid: заметки для импорта/конвертации в CAD (универсально)\n"
         "\n"
         "Файлы в папке результата:\n"
-        f" - {preview_stem}.stl  (mesh)\n"
-        f" - {preview_stem}.ply  (mesh; alternative import)\n"
-        " - ntop_points.csv        (point cloud from occupied voxels; format: x, y, z; no header; may be sampled)\n"
-        " - metadata.json          (параметры/статистика)\n"
+        f" - {preview_stem}.stl            (mesh)\n"
+        f" - {preview_stem}_mesh.ply       (mesh; alternative import)\n"
+        " - voxel_points.csv              (point cloud from occupied voxels; x,y,z; no header; may be sampled)\n"
+        " - metadata.json                 (параметры/статистика)\n"
         "\n"
-        "Шаги в nTop (типовой путь):\n"
-        f" 1) Utilities → Import Mesh → {preview_stem}.stl (Units: mm)\n"
-        " 2) Search: \"Implicit Body from Mesh\" → convert mesh to implicit\n"
-        " 3) (Optional) Smooth/Close/Repair on the implicit body\n"
-        " 4) Convert implicit to CAD/solid body\n"
-        " 5) Export STEP\n"
+        "Типовой путь в стороннем CAD/mesh-инструменте:\n"
+        f" 1) Импортируйте mesh ({preview_stem}.stl / .ply) в единицах mm\n"
+        " 2) При необходимости выполните Repair/Close Holes/Orient Normals\n"
+        " 3) Если инструмент поддерживает: преобразуйте mesh/implicit в solid (B-Rep)\n"
+        " 4) Экспортируйте STEP/Parasolid (или другой CAD-формат)\n"
         "\n"
         "Альтернатива (иногда лучше для решёток/заполнений):\n"
-        " - Import point list (CSV) → create implicit from points → then Convert to CAD/Solid → Export STEP\n"
+        " - Импорт point cloud (voxel_points.csv) → построение implicit/volume → затем solidify → экспорт STEP\n"
         "\n"
-        "Стартовые параметры (подсказка):\n"
+        "Подсказка по шагу/разрешению (если инструмент просит spacing/resolution):\n"
         f" - slice2solid voxel_size_mm = {v:.3f}\n"
         f" - mesh effective voxel (after meshing downsample): {v_mesh:.3f} mm (ds={ds})\n"
-        f" - nTop implicit spacing (from voxels/point-cloud): ~{suggested:.3f} mm (≈ 0.5 * voxel_size)\n"
-        f" - nTop implicit spacing (from mesh): ~{suggested_mesh:.3f} mm (≈ 0.5 * mesh effective voxel)\n"
+        f" - starting spacing (from points/voxels): ~{suggested:.3f} mm (≈ 0.5 * voxel_size)\n"
+        f" - starting spacing (from mesh): ~{suggested_mesh:.3f} mm (≈ 0.5 * mesh effective voxel)\n"
         "   Если слишком медленно: увеличьте spacing. Если теряются детали: уменьшите spacing.\n"
     )
 
@@ -941,7 +971,7 @@ class _Mesh2DView(QtWidgets.QWidget):
         self._image = QtWidgets.QLabel("")
         self._image.setMinimumHeight(200)
         self._image.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self._image.setStyleSheet("background-color: #111317; border: 1px solid #2B2F36;")
+        self._image.setStyleSheet("background-color: #F3F4F6; border: 1px solid #D1D5DB;")
         layout.addWidget(self._image, 1)
 
     def set_mesh(self, mesh: trimesh.Trimesh | None, *, stats_text: str = "", color: str = "#6BCB77") -> None:
@@ -958,7 +988,7 @@ class _Mesh2DView(QtWidgets.QWidget):
             width=w,
             height=h,
             fg=QtGui.QColor(color),
-            bg=QtGui.QColor("#111317"),
+            bg=QtGui.QColor("#F3F4F6"),
         )
         self._image.setText("")
         self._image.setPixmap(QtGui.QPixmap.fromImage(img))
@@ -989,12 +1019,15 @@ class _Mesh3DView(QtWidgets.QWidget):
         self._faces_cb.setChecked(True)
         self._edges_cb = QtWidgets.QCheckBox("Рёбра")
         self._edges_cb.setChecked(True)
+        self._light_bg_cb = QtWidgets.QCheckBox("Светлый фон")
+        self._light_bg_cb.setChecked(True)
         self._auto_fit_btn = QtWidgets.QPushButton("Fit")
         self._auto_fit_btn.setToolTip("Подогнать камеру под модель")
         self._hint = QtWidgets.QLabel("ЛКМ: вращение · колесо: зум · ПКМ: панорама")
         self._hint.setStyleSheet("color: #6B7280;")
         toolbar_layout.addWidget(self._faces_cb, 0)
         toolbar_layout.addWidget(self._edges_cb, 0)
+        toolbar_layout.addWidget(self._light_bg_cb, 0)
         toolbar_layout.addSpacing(8)
         toolbar_layout.addWidget(self._auto_fit_btn, 0)
         toolbar_layout.addStretch(1)
@@ -1002,11 +1035,13 @@ class _Mesh3DView(QtWidgets.QWidget):
         layout.addWidget(toolbar, 0)
 
         self._gl = gl.GLViewWidget()
-        self._gl.setBackgroundColor("#111317")
+        self._gl.setBackgroundColor("#F3F4F6")
         layout.addWidget(self._gl, 1)
         self._mesh_item: object | None = None
         self._edges_item: object | None = None
+        self._edges_seg: np.ndarray | None = None
         self._radius: float = 1.0
+        self._edge_rgba = (0.0, 0.0, 0.0, 0.18)
 
         self._axis = gl.GLAxisItem()
         self._axis.setSize(10, 10, 10)
@@ -1020,7 +1055,32 @@ class _Mesh3DView(QtWidgets.QWidget):
 
         self._faces_cb.toggled.connect(self._apply_visibility)
         self._edges_cb.toggled.connect(self._apply_visibility)
+        self._light_bg_cb.toggled.connect(self._apply_theme)
         self._auto_fit_btn.clicked.connect(self._fit_camera)
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        light = bool(self._light_bg_cb.isChecked())
+        bg = "#F3F4F6" if light else "#111317"
+        grid = QtGui.QColor("#D1D5DB" if light else "#2B2F36")
+        self._edge_rgba = (0.0, 0.0, 0.0, 0.18) if light else (1.0, 1.0, 1.0, 0.22)
+        try:
+            self._gl.setBackgroundColor(bg)
+        except Exception:
+            pass
+        try:
+            self._grid.setColor(grid)
+        except Exception:
+            pass
+        try:
+            self._hint.setStyleSheet("color: #374151;" if light else "color: #9CA3AF;")
+        except Exception:
+            pass
+        if self._edges_item is not None and self._edges_seg is not None:
+            try:
+                self._edges_item.setData(pos=self._edges_seg, color=self._edge_rgba)
+            except Exception:
+                pass
 
     def _fit_camera(self) -> None:
         r = float(self._radius or 1.0)
@@ -1113,12 +1173,14 @@ class _Mesh3DView(QtWidgets.QWidget):
         try:
             edges = self._unique_edges(faces, max_edges=200_000)
             seg = verts[edges.reshape(-1)].reshape((-1, 3))
-            edges_item = gl.GLLinePlotItem(pos=seg, mode="lines", color=(1.0, 1.0, 1.0, 0.22), width=1, antialias=True)
+            self._edges_seg = seg
+            edges_item = gl.GLLinePlotItem(pos=seg, mode="lines", color=self._edge_rgba, width=1, antialias=True)
             edges_item.setGLOptions("translucent")
             self._gl.addItem(edges_item)
             self._edges_item = edges_item
         except Exception:
             self._edges_item = None
+            self._edges_seg = None
 
         # Fit helpers.
         grid_size = max(20.0, 3.0 * float(radius))
@@ -1157,6 +1219,8 @@ class _MeshVTKView(QtWidgets.QWidget):
         toolbar_layout.setContentsMargins(8, 0, 8, 6)
         self._edges_cb = QtWidgets.QCheckBox("Рёбра")
         self._edges_cb.setChecked(True)
+        self._light_bg_cb = QtWidgets.QCheckBox("Светлый фон")
+        self._light_bg_cb.setChecked(True)
         self._clip_cb = QtWidgets.QCheckBox("Сечение")
         self._clip_cb.setChecked(False)
         self._clip_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -1170,6 +1234,8 @@ class _MeshVTKView(QtWidgets.QWidget):
         hint.setStyleSheet("color: #6B7280;")
         toolbar_layout.addWidget(self._edges_cb, 0)
         toolbar_layout.addSpacing(8)
+        toolbar_layout.addWidget(self._light_bg_cb, 0)
+        toolbar_layout.addSpacing(8)
         toolbar_layout.addWidget(self._clip_cb, 0)
         toolbar_layout.addWidget(self._clip_slider, 1)
         toolbar_layout.addSpacing(8)
@@ -1179,7 +1245,7 @@ class _MeshVTKView(QtWidgets.QWidget):
         layout.addWidget(toolbar, 0)
 
         self._plot = QtInteractor(self)
-        self._plot.set_background("#111317")
+        self._plot.set_background("#F3F4F6")
         layout.addWidget(self._plot.interactor, 1)
 
         self._poly: pv.PolyData | None = None
@@ -1187,6 +1253,7 @@ class _MeshVTKView(QtWidgets.QWidget):
         self._bounds: np.ndarray | None = None
 
         self._edges_cb.toggled.connect(self._update_render)
+        self._light_bg_cb.toggled.connect(self._update_render)
         self._clip_cb.toggled.connect(self._toggle_clip)
         self._clip_slider.valueChanged.connect(self._update_render)
         self._fit_btn.clicked.connect(self._fit_camera)
@@ -1249,12 +1316,21 @@ class _MeshVTKView(QtWidgets.QWidget):
             color=self._color,
             smooth_shading=True,
             show_edges=bool(self._edges_cb.isChecked()),
-            edge_color="#2B2F36",
-            ambient=0.2,
+            edge_color="#1F2937" if self._light_bg_cb.isChecked() else "#E5E7EB",
+            ambient=0.35 if self._light_bg_cb.isChecked() else 0.25,
             diffuse=0.8,
             specular=0.15,
             specular_power=20.0,
         )
+        try:
+            self._plot.set_background("#F3F4F6" if self._light_bg_cb.isChecked() else "#111317")
+        except Exception:
+            pass
+        try:
+            # Improves depth perception for dense meshes (best-effort).
+            self._plot.enable_eye_dome_lighting()
+        except Exception:
+            pass
         self._plot.show_axes()
         self._plot.render()
 
@@ -1322,9 +1398,9 @@ _HELP_HTML = """
   <li><b>Папка результата (Output folder)</b>: сюда пишутся файлы.</li>
 </ol>
 
-<h3>2) Вкладка “nTop / Геометрия”</h3>
+<h3>2) Вкладка “CAD / Геометрия”</h3>
 <ul>
-  <li>Выход: <code>*_s2s_preview_structure.stl</code> + (опционально) <code>*_s2s_preview_structure.ply</code>, <code>ntop_points.csv</code>, <code>ntop_recipe.txt</code> + <code>metadata.json</code> (в имени mesh-файлов есть имя детали и параметры).</li>
+  <li>Выход: <code>*_s2s_preview_structure.stl</code> + (опционально) <code>*_s2s_preview_structure_mesh.ply</code>, <code>voxel_points.csv</code>, <code>cad_import_notes.txt</code> + <code>metadata.json</code> (в имени mesh-файлов есть имя детали и параметры).</li>
   <li><b>Пресеты</b> — быстрые наборы настроек. Выберите пресет и нажмите <b>Применить</b>. При ручных изменениях режим становится <b>Custom</b>.</li>
   <li><b>Voxel size</b> — главный “качество↔скорость”. Меньше → точнее, но сильно тяжелее по RAM/времени и размеру STL.</li>
   <li><b>Downsample для meshing</b> — упрощает построение поверхности (marching cubes) по разреженному объёму (каждый N-й воксель): резко ускоряет meshing и уменьшает STL, но может “съесть” тонкие элементы.</li>
@@ -1334,13 +1410,36 @@ _HELP_HTML = """
   <li>Если есть мелкие "островки" сетки вокруг: увеличьте <b>Remove mesh islands</b>.</li>
 </ul>
 
-<p><b>Как получить гладкий STEP в nTop (рекомендуется для решёток/заполнений):</b><br/>
-Utilities → <b>Import Mesh</b> → затем <b>Implicit Body from Mesh</b> → (по ситуации: Smooth/Close/Repair) → Convert to CAD/Solid → Export STEP.<br/>
-Если включён <b>nTop bundle</b>, рядом с STL будет файл <code>ntop_recipe.txt</code> с подсказками по стартовым параметрам.</p>
+<p><b>Как получить STEP/твердое тело в стороннем CAD/mesh-инструменте:</b><br/>
+Импортируйте mesh (STL/PLY) → при необходимости Repair/Close/Orient Normals → затем (если поддерживается) Convert to Solid (B-Rep) → Export STEP.<br/>
+Если включён <b>CAD bundle</b>, рядом с STL будет файл <code>cad_import_notes.txt</code> с подсказками по стартовым параметрам (spacing/resolution) на основе параметров slice2solid.</p>
+
+<h4>2.1 Mesh Healer (CAD)</h4>
+<ul>
+  <li><b>Зачем:</b> некоторые CAD-системы плохо импортируют "грязные" STL (дырки, дубликаты, нулевые грани, проблемы ориентации). Mesh Healer пытается автоматически исправить типовые дефекты.</li>
+  <li><b>Что делает (safe):</b> удаляет дубликаты вершин/граней, удаляет неиспользуемые вершины, удаляет нулевые грани, переориентирует грани, закрывает небольшие отверстия.</li>
+  <li><b>Профиль:</b> <code>safe</code> (по умолчанию, без ремешинга/упрощения) и <code>aggressive</code> (доп. попытки убрать self-intersections; использовать только если safe не помогает).</li>
+  <li><b>Порог дырок (мм):</b> <code>close_holes_max</code> задаёт максимальный размер дырок для закрытия. Примечание: в MeshLab/pymeshlab это обычно лимит по числу рёбер контура, поэтому мм переводятся в рёбра по оценке (это видно в JSON-отчёте).</li>
+  <li><b>Выход:</b> рядом с STL появляется <code>*_healed.stl</code> (и опционально <code>*_healed_report.json</code>).</li>
+</ul>
 
 <h3>Быстрый гайд по параметрам (что крутить)</h3>
 <table border="1" cellpadding="6" cellspacing="0">
   <tr><th>Параметр</th><th>Эффект</th><th>Плюсы</th><th>Минусы</th><th>Стартовые значения</th></tr>
+  <tr>
+    <td><b>CAD bundle</b></td>
+    <td>Пишет доп. файлы для удобного импорта: <code>*.ply</code>, <code>voxel_points.csv</code>, <code>cad_import_notes.txt</code>.</td>
+    <td>Упрощает импорт/подбор spacing, даёт point cloud для альтернативного восстановления.</td>
+    <td>Доп. файлы в папке результата.</td>
+    <td>Включено</td>
+  </tr>
+  <tr>
+    <td><b>Mesh Healer (CAD)</b></td>
+    <td>Автоматически исправляет типовые дефекты сетки после экспорта STL.</td>
+    <td>Повышает шанс корректного импорта и "watertight" сетки.</td>
+    <td>Может не помочь при очень сложной/самопересекающейся сетке; aggressive может удалять проблемные области.</td>
+    <td>Выключено; включать при проблемах импорта</td>
+  </tr>
   <tr>
     <td><b>Voxel size (mm)</b></td>
     <td>Размер ячейки сетки, из которой строится поверхность.</td>
@@ -1386,7 +1485,7 @@ Utilities → <b>Import Mesh</b> → затем <b>Implicit Body from Mesh</b> �
   <tr>
     <td><b>Mesh smoothing (iterations)</b></td>
     <td>Laplacian smoothing по вершинам после marching cubes.</td>
-    <td>Убирает “рывки”, делает поверхность приятнее для nTop.</td>
+    <td>Убирает "рывки", делает поверхность приятнее для импорта/ремонта в CAD/mesh-инструментах.</td>
     <td>Слишком много → усадка/замыливание деталей.</td>
     <td>10–30 (начать с 15)</td>
   </tr>
@@ -1406,7 +1505,7 @@ Utilities → <b>Import Mesh</b> → затем <b>Implicit Body from Mesh</b> �
   <li>Если доступен VTK/pyvista: есть режим <b>Сечение</b> по Z и отображение <b>рёбер</b>; кнопка <b>Fit</b> подгоняет камеру.</li>
 </ul>
 
-<h3>4) Вкладка “ANSYS / CAE” (ANSYS 2025 R2)</h3>
+<h3>4) Вкладка “ANSYS / CAE”</h3>
 <ul>
   <li>Выход: <code>ansys_layers.json</code>, <code>ansys_layers.csv</code>, <code>ansys_mechanical_import_layers.py</code>.</li>
   <li>Идея: назначить ортотропию по слоям (X вдоль печати, Z — build direction).</li>
@@ -1479,11 +1578,11 @@ class MainWindow(QtWidgets.QMainWindow):
         main_splitter.addWidget(top_panel)
 
         header = QtWidgets.QLabel(
-            "Цель: получить `*_s2s_preview_structure.stl`, который открывается в nTop и "
-            "дальше конвертируется в solid/STEP средствами nTop.\n"
+            "Цель: получить `*_s2s_preview_structure.stl`, который можно импортировать как mesh в CAD/CAE и, при необходимости,\n"
+            "сконвертировать в твердое тело (STEP) средствами стороннего CAD/mesh-инструмента.\n"
             "Поддержки/подложка (`Type=0`) игнорируются; используется только траектория модели (`Type=1`).\n"
             "Подсказки: наведите курсор на параметр (или Shift+F1 → клик)."
-            "Пайплайн: Import Mesh → Implicit Body from Mesh → (Smooth/Close/Repair) → Convert to CAD/Solid → Export STEP."
+            "Пайплайн: Import Mesh → Repair/Close/Orient Normals → (если поддерживается) Convert to Solid (B-Rep) → Export STEP."
         )
         header.setWordWrap(True)
         top_layout.addWidget(header)
@@ -1530,7 +1629,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.out_edit = QtWidgets.QLineEdit()
         self.out_edit.setPlaceholderText(
-            r"Папка результата (*_s2s_preview_structure.stl/ply, ntop_recipe.txt, metadata.json, ...)"
+            r"Папка результата (*_s2s_preview_structure.stl/ply, cad_import_notes.txt, metadata.json, ...)"
         )
         _set_help(
             self.out_edit,
@@ -1549,9 +1648,9 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs = QtWidgets.QTabWidget()
         top_layout.addWidget(tabs, 1)
 
-        # --- Tab: nTop / Geometry preview ---
+        # --- Tab: CAD / Geometry preview ---
         geometry_tab = QtWidgets.QWidget()
-        tabs.addTab(geometry_tab, "nTop / Геометрия")
+        tabs.addTab(geometry_tab, "CAD / Геометрия")
         geo_outer = QtWidgets.QVBoxLayout(geometry_tab)
         geo_outer.setContentsMargins(0, 0, 0, 0)
 
@@ -1569,8 +1668,8 @@ class MainWindow(QtWidgets.QMainWindow):
         geo_layout.setContentsMargins(0, 0, 0, 0)
 
         geo_intro = QtWidgets.QLabel(
-            "Режим nTop: восстановление внутренней структуры и экспорт `*_s2s_preview_structure.stl`.\n"
-            "Дальше: nTop → mesh → implicit → solidify/repair → экспорт STEP."
+            "Режим CAD: восстановление внутренней структуры и экспорт `*_s2s_preview_structure.stl`.\n"
+            "Дальше: импорт в сторонний CAD/mesh-инструмент → repair/solidify (если нужно) → экспорт STEP."
         )
         geo_intro.setWordWrap(True)
         geo_layout.addWidget(geo_intro)
@@ -1585,13 +1684,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.export_geometry.setWhatsThis(self.export_geometry.toolTip())
         geo_form.addRow("Выходная геометрия:", self.export_geometry)
 
-        self.export_ntop = QtWidgets.QCheckBox("Экспортировать набор для nTop (PLY + ntop_points.csv + ntop_recipe.txt)")
-        self.export_ntop.setChecked(True)
-        self.export_ntop.setToolTip(
-            "Доп. файлы для nTop: PLY (mesh), ntop_points.csv (point cloud из вокселей) и краткий рецепт импорта/параметров."
+        self.export_bundle = QtWidgets.QCheckBox(
+            "Экспортировать CAD bundle (PLY + voxel_points.csv + cad_import_notes.txt)"
         )
-        self.export_ntop.setWhatsThis(self.export_ntop.toolTip())
-        geo_form.addRow("Набор для nTop:", self.export_ntop)
+        self.export_bundle.setChecked(True)
+        self.export_bundle.setToolTip(
+            "Доп. универсальные файлы для внешних CAD/mesh-инструментов: PLY (mesh), voxel_points.csv (point cloud из вокселей)\n"
+            "и cad_import_notes.txt (краткие подсказки по импорту/spacing на основе параметров slice2solid)."
+        )
+        self.export_bundle.setWhatsThis(self.export_bundle.toolTip())
+        geo_form.addRow("CAD bundle:", self.export_bundle)
+
+        heal_group = QtWidgets.QGroupBox("Mesh Healer (CAD)")
+        heal_form = QtWidgets.QFormLayout(heal_group)
+        geo_layout.addWidget(heal_group)
+
+        self.heal_enable = QtWidgets.QCheckBox("Автоматически исправить сетку после экспорта STL (*_healed.stl)")
+        self.heal_enable.setChecked(False)
+        self.heal_enable.setToolTip(
+            "Исправляет типовые проблемы сетки (дубликаты, нулевые грани, ориентация, небольшие дырки).\n"
+            "Без ремешинга/упрощения, чтобы не разрушить инфилл.\n"
+            "Backend по умолчанию: pymeshlab (если доступен), иначе meshlabserver."
+        )
+        self.heal_enable.setWhatsThis(self.heal_enable.toolTip())
+        heal_form.addRow("Включить:", self.heal_enable)
+
+        self.heal_preset_combo = QtWidgets.QComboBox()
+        self.heal_preset_combo.addItems(["safe", "aggressive"])
+        self.heal_preset_combo.setCurrentText("safe")
+        self.heal_preset_combo.setToolTip("safe: без агрессивного удаления; aggressive: доп. попытки удалить self-intersections.")
+        heal_form.addRow("Профиль:", self.heal_preset_combo)
+
+        self.close_holes_max = QtWidgets.QDoubleSpinBox()
+        self.close_holes_max.setRange(0.0, 100.0)
+        self.close_holes_max.setDecimals(2)
+        self.close_holes_max.setSingleStep(0.5)
+        self.close_holes_max.setValue(2.0)
+        self.close_holes_max.setToolTip(
+            "Максимальный размер дырки (мм) для закрытия.\n"
+            "Примечание: MeshLab использует лимит по числу рёбер контура; программа переводит мм в рёбра по оценке."
+        )
+        heal_form.addRow("Закрывать дырки до (мм):", self.close_holes_max)
+
+        self.heal_report = QtWidgets.QCheckBox("Записать JSON-отчёт (до/после)")
+        self.heal_report.setChecked(False)
+        heal_form.addRow("Отчёт:", self.heal_report)
+
+        self.heal_report_path_edit = QtWidgets.QLineEdit()
+        self.heal_report_path_edit.setPlaceholderText("Путь (опционально). Пусто = рядом со STL")
+        self.heal_report_path_btn = QtWidgets.QPushButton("Обзор…")
+        report_row = QtWidgets.QHBoxLayout()
+        report_row.addWidget(self.heal_report_path_edit, 1)
+        report_row.addWidget(self.heal_report_path_btn)
+        heal_form.addRow("Файл отчёта:", report_row)
 
         self.voxel_size = QtWidgets.QDoubleSpinBox()
         self.voxel_size.setRange(0.05, 5.0)
@@ -1757,7 +1902,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.smooth,
             title="Сглаживание сетки (итерации)",
             body="Сглаживание уже готовой сетки (Laplacian).",
-            pros="Убирает ‘рывки’ и делает поверхность приятнее для имплицитизации в nTop.",
+            pros="Убирает ‘рывки’ и делает поверхность приятнее для последующей постобработки/конвертации в CAD.",
             cons="Может вызывать усадку/замыливание деталей при больших значениях.",
             tip="10–30 обычно достаточно. Если форма начинает ‘плыть’ — уменьшите.",
         )
@@ -1907,7 +2052,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ansys_form.addRow("", self.ansys_create_cs)
 
         ansys_hint = QtWidgets.QLabel(
-            "ANSYS 2025 R2:\n"
+            "ANSYS Mechanical:\n"
             "1) Импортируйте геометрию, сгенерируйте mesh.\n"
             "2) Mechanical → Automation → Scripting → Run Script…\n"
             "3) Запустите ansys_mechanical_import_layers.py из папки результата.\n"
@@ -2005,6 +2150,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.smooth.valueChanged.connect(self._recompute_estimate)
         self.export_geometry.toggled.connect(self._recompute_estimate)
         self.export_geometry.toggled.connect(self._update_step_widgets)
+        self.heal_enable.toggled.connect(self._update_step_widgets)
+        self.heal_report.toggled.connect(self._update_step_widgets)
+        self.heal_report_path_btn.clicked.connect(self._pick_heal_report_path)
         self.open_out_btn.clicked.connect(self._open_output_folder)
         self.outputs_list.itemSelectionChanged.connect(self._update_output_buttons)
         self.outputs_list.itemDoubleClicked.connect(self._open_selected_output)
@@ -2024,7 +2172,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # If user edits any parameter manually -> switch preset to Custom.
         for w in (
             self.export_geometry,
-            self.export_ntop,
+            self.export_bundle,
+            self.heal_enable,
+            self.heal_preset_combo,
+            self.close_holes_max,
+            self.heal_report,
+            self.heal_report_path_edit,
             self.voxel_size,
             self.auto_radius,
             self.max_radius,
@@ -2040,6 +2193,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._connect_any_change(w, self._mark_ansys_preset_custom)
 
         self._restore_settings()
+        self._update_step_widgets()
         self._update_preview_buttons()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
@@ -2126,23 +2280,35 @@ class MainWindow(QtWidgets.QMainWindow):
             for x in outputs:
                 p = str(x)
                 pl = p.lower()
-                if pl.endswith("_before.ply"):
+                if pl.endswith("_mesh_before.ply") or pl.endswith("_before.ply"):
                     before_path = p
-                if pl.endswith(".ply") and "_before" not in pl and "_s2s_preview_structure" in pl:
+                if pl.endswith("_mesh.ply") and "_s2s_preview_structure" in pl:
+                    after_path = p
+                if pl.endswith(".ply") and "_before" not in pl and "_s2s_preview_structure" in pl and after_path is None:
                     after_path = p
                 if pl.endswith(".stl") and "_s2s_preview_structure" in pl and after_path is None:
                     after_path = p
 
         if after_path is None:
             candidates = sorted(
-                out_dir.glob("*_s2s_preview_structure*.ply"), key=lambda p: p.stat().st_mtime, reverse=True
+                out_dir.glob("*_s2s_preview_structure*_mesh.ply"), key=lambda p: p.stat().st_mtime, reverse=True
             )
+            if candidates:
+                after_path = str(candidates[0])
+        if after_path is None:
+            # Backward compatibility: older runs used `{stem}.ply`.
+            candidates = sorted(out_dir.glob("*_s2s_preview_structure*.ply"), key=lambda p: p.stat().st_mtime, reverse=True)
             if candidates:
                 after_path = str(candidates[0])
         if before_path is None:
             candidates = sorted(
-                out_dir.glob("*_s2s_preview_structure*_before.ply"), key=lambda p: p.stat().st_mtime, reverse=True
+                out_dir.glob("*_s2s_preview_structure*_mesh_before.ply"), key=lambda p: p.stat().st_mtime, reverse=True
             )
+            if candidates:
+                before_path = str(candidates[0])
+        if before_path is None:
+            # Backward compatibility: older runs used `{stem}_before.ply`.
+            candidates = sorted(out_dir.glob("*_s2s_preview_structure*_before.ply"), key=lambda p: p.stat().st_mtime, reverse=True)
             if candidates:
                 before_path = str(candidates[0])
 
@@ -2359,8 +2525,9 @@ class MainWindow(QtWidgets.QMainWindow):
             " - *_s2s_preview_structure.stl (если включён экспорт геометрии)\n"
             " - metadata.json (параметры/матрица/статистика)\n"
             " - ansys_layers.json/csv + ansys_mechanical_import_layers.py (если включён экспорт ANSYS)\n"
-            " - *_s2s_preview_structure.ply, ntop_points.csv, ntop_recipe.txt (если включён набор для nTop)\n\n"
-            "Подробности: вкладка 'Справка' и docs/ntop_import_guide_ru.md."
+            " - *_s2s_preview_structure_mesh.ply, voxel_points.csv, cad_import_notes.txt (если включён CAD bundle)\n\n"
+            " - *_healed.stl (+ *_healed_report.json), если включён Mesh Healer (CAD)\n\n"
+            "Подробности: вкладка 'Справка' и docs/cad_import_guide_ru.md."
         )
         QtWidgets.QMessageBox.information(self, "Как пользоваться", msg)
 
@@ -2411,9 +2578,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_step_widgets(self) -> None:
         enabled = bool(self.export_geometry.isChecked())
-        self.export_ntop.setEnabled(enabled)
+        self.export_bundle.setEnabled(enabled)
         if not enabled:
-            self.export_ntop.setChecked(False)
+            self.export_bundle.setChecked(False)
+        heal_master_enabled = enabled and bool(self.heal_enable.isChecked())
+        self.heal_preset_combo.setEnabled(heal_master_enabled)
+        self.close_holes_max.setEnabled(heal_master_enabled)
+        self.heal_report.setEnabled(heal_master_enabled)
+        report_enabled = heal_master_enabled and bool(self.heal_report.isChecked())
+        self.heal_report_path_edit.setEnabled(report_enabled)
+        self.heal_report_path_btn.setEnabled(report_enabled)
+
+    def _pick_heal_report_path(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Файл JSON-отчёта", "", "JSON (*.json)")
+        if path:
+            self.heal_report_path_edit.setText(path)
 
     def _recompute_auto_radius(self) -> None:
         if not self.auto_radius.isChecked():
@@ -2472,7 +2651,7 @@ class MainWindow(QtWidgets.QMainWindow):
         stl = self.stl_edit.text().strip()
         out = self.out_edit.text().strip()
         do_geo = bool(self.export_geometry.isChecked())
-        do_ntop = bool(self.export_ntop.isChecked()) and do_geo
+        do_bundle = bool(self.export_bundle.isChecked()) and do_geo
         do_cae = bool(self.export_cae.isChecked())
         if not sim or not out or (do_geo and not stl):
             QtWidgets.QMessageBox.warning(
@@ -2558,11 +2737,17 @@ class MainWindow(QtWidgets.QMainWindow):
             smooth_iterations=int(self.smooth.value()),
             export_cae_layers=do_cae,
             export_geometry_preview=do_geo,
-            export_ntop_bundle=do_ntop,
+            export_cad_bundle=do_bundle,
             ansys_min_confidence=float(self.ansys_min_conf.value()),
             ansys_group_size_layers=int(self.ansys_group_layers.value()),
             ansys_create_named_selections=bool(self.ansys_create_ns.isChecked()),
             ansys_create_coordinate_systems=bool(self.ansys_create_cs.isChecked()),
+            heal_enabled=bool(do_geo and self.heal_enable.isChecked()),
+            heal_preset=str(self.heal_preset_combo.currentText()).strip().lower() or "safe",
+            heal_close_holes_max_mm=float(self.close_holes_max.value()),
+            heal_report_enabled=bool(do_geo and self.heal_enable.isChecked() and self.heal_report.isChecked()),
+            heal_report_path=str(self.heal_report_path_edit.text().strip()) or None,
+            heal_backend="auto",
         )
 
         self.progress.setValue(0)

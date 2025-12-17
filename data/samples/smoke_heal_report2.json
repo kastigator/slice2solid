@@ -1,0 +1,55 @@
+{
+  "input_path": "data\\samples\\smoke_preview_structure.stl",
+  "output_path": "data\\samples\\smoke_preview_structure_healed.stl",
+  "preset": "safe",
+  "backend": "pymeshlab",
+  "close_holes_max_mm": 2.0,
+  "close_holes_max_edges": 30,
+  "conversion": {
+    "reason": "no_boundary_detected",
+    "fallback_edges": 30
+  },
+  "before": {
+    "path": "data\\samples\\smoke_preview_structure.stl",
+    "vertices": 18120,
+    "faces": 6040,
+    "bbox_min": [
+      -1.5,
+      -1.5,
+      -2.0
+    ],
+    "bbox_max": [
+      50.5,
+      50.5,
+      1.5
+    ],
+    "bbox_diag_mm": 73.62234715084816,
+    "watertight": false,
+    "winding_consistent": true,
+    "volume_mm3": null,
+    "boundary_edges": null,
+    "boundary_loops": null
+  },
+  "after": {
+    "path": "data\\samples\\smoke_preview_structure_healed.stl",
+    "vertices": 18120,
+    "faces": 6040,
+    "bbox_min": [
+      -1.5,
+      -1.5,
+      -2.0
+    ],
+    "bbox_max": [
+      50.5,
+      50.5,
+      1.5
+    ],
+    "bbox_diag_mm": 73.62234715084816,
+    "watertight": false,
+    "winding_consistent": true,
+    "volume_mm3": null,
+    "boundary_edges": null,
+    "boundary_loops": null
+  },
+  "warnings": []
+}

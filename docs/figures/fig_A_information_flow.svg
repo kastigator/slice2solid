@@ -3592,7 +3592,7 @@ z
      <use xlink:href="#DejaVuSans-440" transform="translate(413.720703 0)"/>
      <use xlink:href="#DejaVuSans-44b" transform="translate(477.197266 0)"/>
     </g>
-    <!-- (опц.) *_s2s_preview_structure.ply, -->
+    <!-- (опц.) *_s2s_preview_structure_mesh.ply, -->
     <g transform="translate(736.3296 145.55523) scale(0.096 -0.096)">
      <use xlink:href="#DejaVuSans-28"/>
      <use xlink:href="#DejaVuSans-43e" transform="translate(39.013672 0)"/>
@@ -3630,7 +3630,7 @@ z
      <use xlink:href="#DejaVuSans-79" transform="translate(1674.992188 0)"/>
      <use xlink:href="#DejaVuSans-2c" transform="translate(1734.171875 0)"/>
     </g>
-    <!-- ntop_points.csv, ntop_recipe.txt -->
+    <!-- voxel_points.csv, cad_import_notes.txt -->
     <g transform="translate(736.3296 156.936855) scale(0.096 -0.096)">
      <use xlink:href="#DejaVuSans-6e"/>
      <use xlink:href="#DejaVuSans-74" transform="translate(63.378906 0)"/>
@@ -3981,7 +3981,7 @@ z
     </g>
    </g>
    <g id="text_17">
-    <!-- Конвертация сетки в твердое тело (nTop или -->
+    <!-- Конвертация сетки в твердое тело (внешний CAD/mesh-инструмент или -->
     <g transform="translate(736.3296 303.005559) scale(0.105 -0.105)">
      <defs>
       <path id="DejaVuSans-41a" d="M 628 4666 
@@ -4144,7 +4144,7 @@ z
      <use xlink:href="#DejaVuSans-70" transform="translate(2107.121094 0)"/>
      <use xlink:href="#DejaVuSans-29" transform="translate(2170.597656 0)"/>
     </g>
-    <!-- → импорт в SolidWorks -->
+    <!-- → импорт в CAD (mesh) -->
     <g transform="translate(736.3296 339.767454) scale(0.105 -0.105)">
      <defs>
       <path id="DejaVuSans-57" d="M 213 4666 
