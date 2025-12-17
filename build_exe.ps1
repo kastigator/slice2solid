@@ -4,6 +4,7 @@ Set-Location $PSScriptRoot
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# Builds a standalone GUI executable (PyInstaller). CLI entrypoint is `run_cli.py`.
 if (!(Test-Path ".\\.venv\\Scripts\\python.exe")) {
   throw "Virtualenv not found at .venv. Create it first (python -m venv .venv) and install requirements."
 }
@@ -34,6 +35,7 @@ if (Test-Path $dist) {
   --collect-all trimesh `
   --collect-all shapely `
   --collect-all rtree `
+  --collect-all pymeshlab `
   run_gui.py
 
 Write-Host "Built: $PSScriptRoot\\dist_exe\\slice2solid.exe"

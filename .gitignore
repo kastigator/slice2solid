@@ -198,6 +198,12 @@ tools/installer/Output/
 # Ruff stuff:
 .ruff_cache/
 
+# slice2solid output artifacts (user output folders)
+*_healed.stl
+*_healed_report.json
+cad_import_notes.txt
+voxel_points.csv
+
 # PyPI configuration file
 .pypirc
 

@@ -9,4 +9,5 @@ from slice2solid.gui.app import main  # noqa: E402
 
 
 if __name__ == "__main__":
-    main()
+    # GUI entrypoint (repo root). For CLI utilities, see `run_cli.py`.
+    raise SystemExit(main())
