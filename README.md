@@ -1,132 +1,215 @@
 # slice2solid
 
-**slice2solid** is an engineering-oriented tool for reconstructing
-FDM-printed parts based on slicer data (Stratasys Insight),
-with the primary goal of enabling **structural (CAE) analysis**
-and optional **explicit geometry reconstruction**.
+**slice2solid** — инженерно-ориентированный инструмент для восстановления цифрового представления
+FDM-деталей по данным слайсинга **Stratasys Insight**.
+Основная цель — обеспечить корректный **прочностной анализ (CAE/ANSYS)** с учётом траекторий печати,
+а также (опционально) выполнить **явную геометрическую реконструкцию** внутренней структуры (инфилла/периметров) в виде mesh.
 
-The project bridges the gap between:
-- CAD geometry,
-- slicer manufacturing intent,
-- and finite element analysis (ANSYS).
-
----
-
-## Project Motivation
-
-Standard CAD-to-CAE workflows treat FDM-printed parts as isotropic solids,
-ignoring:
-- printing orientation,
-- layer structure,
-- toolpath directions,
-- infill patterns.
-
-This project provides a methodology and tooling to:
-- account for **process-induced anisotropy**,
-- map slicer toolpaths to **material orientation fields**,
-- perform structurally meaningful CAE simulations,
-- optionally reconstruct the **explicit internal infill geometry**
-  for CAD assemblies and downstream use.
+Проект закрывает разрыв между:
+- геометрией в САПР (CAD),
+- «производственным намерением» слайсера (траектории, инфилл, периметры),
+- и конечно-элементным анализом (CAE/ANSYS).
 
 ---
 
-## Key Concepts
+## Контекст проекта (Project Background)
 
-The project uses a **dual-representation approach**:
+Проект разработан в рамках исследовательской работы, связанной с ауксетическими и решётчатыми (lattice)
+структурами, изготавливаемыми промышленной FDM‑печатью.
 
-### 1. CAE-Oriented Representation (Primary)
-- Smooth solid geometry (based on placed STL)
-- No explicit infill geometry
-- Internal FDM structure represented via:
-  - transversely isotropic material model
-  - toolpath-based material orientation
-- Intended for structural analysis (ANSYS)
-
-### 2. Geometry Reconstruction Mode (Optional)
-- Explicit reconstruction of infill and perimeters
-- Based on the same slicer toolpath data
-- Intended for:
-  - CAD assemblies
-  - mass and inertia evaluation
-  - visualization and archiving
+Промышленные принтеры Stratasys широко используются в лабораториях и на предприятиях, однако
+проприетарный слайсер **Stratasys Insight** не предоставляет средств для восстановления фактической внутренней геометрии
+(инфилл, периметры, траектории), необходимой для последующего инженерного анализа.
 
 ---
 
-## Typical Workflow
+## Постановка проблемы (Problem Statement)
 
-1. Design monolithic part in CAD
-2. Export STL from CAD
-3. Import STL into Stratasys Insight
-4. Orient part on build plate and save *placed STL*
-5. Perform slicing
-6. Export toolpath simulation data (`*-simulation-data.txt`)
-7. Use `slice2solid` to:
-   - generate CAE-ready representation
-   - map toolpath-based material orientations
-8. Perform structural analysis in ANSYS
-9. (Optional) Reconstruct explicit infill geometry
+После слайсинга в Stratasys Insight:
+- фактическая внутренняя структура детали теряется для CAD/CAE‑систем;
+- невозможно выполнить корректный FEM‑анализ с учётом геометрии инфилла;
+- анизотропия, присущая FDM‑печати, не может быть адекватно учтена;
+- восстановленная геометрия не переиспользуется в CAD‑сборках.
+
+Стандартные CAD/CAE‑инструменты не решают эту задачу напрямую.
 
 ---
 
-## Inputs
+## Решение: что делает slice2solid (Solution)
 
-Minimum required:
-- Insight toolpath simulation export (text), e.g. `*-simulation-data.txt` (contains the `Toolpath Simulation Data` header block, `STL to CMB` matrix, and the toolpath table)
-- placed STL exported from Insight (required for geometry export/preview)
+slice2solid восстанавливает представление FDM‑детали **после** слайсинга в Stratasys Insight на основе экспортов слайсера.
+Инструмент поддерживает два режима, использующих одни и те же входные данные:
 
-Optional (recommended for better defaults/metadata):
-- Insight job folder `ssys_*` containing `sliceParams.*`, `toolpathParams.*`, `supportParams.*` and related artifacts
+### 1) CAE‑представление (основной режим)
+- гладкая замкнутая геометрия по `placed STL`;
+- учёт структуры печати через анизотропные свойства и ориентации по траекториям;
+- экспорт данных ориентаций/слоёв для ANSYS Mechanical.
 
-Notes:
-- The simulation export header is used for `Slice height`, `Segment filter length`, shrink factors, and matrix validation.
-- Locale robustness: some exports may use a comma decimal separator.
+### 2) Геометрическая реконструкция (опционально)
+- явная реконструкция инфилла/периметров в виде mesh на основе траекторий;
+- подходит для визуализации, оценки массы/инерции и последующей конвертации во внешних CAD/mesh‑инструментах.
 
 ---
 
-## Repository Structure
+## Промышленная значимость (Industrial Relevance)
+
+Stratasys‑принтеры активно используются в промышленности и университетах, при этом инженерным подразделениям часто
+не хватает инструмента, позволяющего выполнить корректный пост‑процессинг и анализ деталей со сложной внутренней структурой.
+
+slice2solid позволяет:
+- готовить данные для механических расчётов с учётом структуры печати;
+- оценивать массу/жёсткость с учётом траекторий/заполнения;
+- переиспользовать результат в CAD‑сборках (через mesh‑представление и внешнюю конвертацию).
+
+---
+
+## Связь с исследовательской работой (Relation to Research Work)
+
+ПО разработано как часть исследовательской деятельности, связанной с ауксетическими и решётчатыми структурами,
+изготавливаемыми аддитивными технологиями.
+Инструмент служит инфраструктурным решением, позволяющим проводить дальнейшие исследования механических и функциональных свойств
+печатных структур.
+
+---
+
+## Быстрый старт (Python)
+
+Требования:
+- Windows (из-за Stratasys Insight; код проекта — Python);
+- Python 3.11+;
+- данные из Stratasys Insight: `*-simulation-data.txt` и `placed STL`;
+- (опционально) ANSYS Mechanical для импорта ориентаций/слоёв.
+
+Установка (из корня репозитория):
+- `python -m venv .venv`
+- `.\.venv\Scripts\Activate.ps1`
+- `pip install -r requirements.txt`
+
+Запуск GUI (основной режим):
+- `python run_gui.py`
+
+Если процесс GUI стартует, но окно не видно (например, после отключения второго монитора):
+- `python run_gui.py --reset-ui`
+
+CLI‑утилита (на данный момент — standalone Mesh Healer):
+- `python run_cli.py heal data/samples/smoke_preview_structure.stl --heal-preset safe --close-holes-max 2.0 --report heal_report.json`
+
+---
+
+## Типовой рабочий процесс (Typical Workflow)
+
+1. Спроектировать монолитное тело в CAD
+2. Экспортировать STL из CAD
+3. Импортировать STL в Stratasys Insight
+4. Ориентировать деталь и сохранить `placed STL`
+5. Выполнить slicing
+6. Экспортировать симуляцию траекторий: `*-simulation-data.txt`
+7. Запустить `slice2solid` для получения:
+   - CAE‑ориентированного представления и ориентаций траекторий
+   - (опционально) mesh‑геометрии внутренней структуры
+8. Выполнить расчёт в ANSYS
+
+---
+
+## Входные данные (Inputs)
+
+Минимально необходимо:
+- текстовый экспорт симуляции траекторий из Insight: `*-simulation-data.txt` (с блоком заголовка `Toolpath Simulation Data`, матрицей `STL to CMB transformation matrix` и таблицей траекторий);
+- `placed STL` из Insight (эталонная геометрия для габаритов/сопоставления координат и предпросмотра/экспорта).
+
+Опционально (рекомендуется для авто‑параметров/метаданных):
+- папка задания Insight `ssys_*` с `sliceParams.*`, `toolpathParams.*`, `supportParams.*` и др.
+
+Примечания:
+- заголовок Simulation Data используется для `Slice height`, shrink factors, проверок матрицы и др.;
+- учтена локаль: в экспортируемых числах может встречаться запятая как десятичный разделитель.
+
+---
+
+## Выходные данные (Outputs)
+
+Основные выходные файлы (в выбранной папке результата):
+- `*_s2s_preview_structure.stl` — mesh‑результат пайплайна (предпросмотр/экспорт структуры);
+- `*_s2s_preview_structure_healed.stl` — (опционально) «вылеченная» сетка для импорта в CAD как mesh;
+- `*_s2s_preview_structure_healed_report.json` — (опционально) отчёт до/после по сетке;
+- `*_s2s_preview_structure_mesh.ply`, `voxel_points.csv`, `cad_import_notes.txt` — (опционально) CAD bundle для внешних инструментов;
+- `ansys_layers.json`, `ansys_layers.csv`, `ansys_mechanical_import_layers.py` — (опционально) экспорт для ANSYS Mechanical;
+- `metadata.json` — метаданные запуска (параметры, матрицы, оценки размеров/сеток и т.п.).
+
+---
+
+## Структура репозитория
 
 ```text
 slice2solid/
-├─ TECHNICAL_SPECIFICATION.md        # Technical specification (EN)
-├─ TECHNICAL_SPECIFICATION_RU.md     # Technical specification (RU)
-├─ README.md                         # Project overview and usage
-├─ requirements.txt
-├─ src/                              # Source code
-├─ data/                             # Input/output examples (ignored in git if large)
-├─ tests/                            # Validation and test cases
-└─ .gitignore
+  TECHNICAL_SPECIFICATION.md        # Техническая спецификация (EN)
+  TECHNICAL_SPECIFICATION_RU.md     # Техническая спецификация (RU)
+  README.md                         # Описание проекта и запуск
+  requirements.txt
+  src/                              # Исходный код
+  data/                             # Примеры вход/выход
+  tests/                            # Тесты/валидация
+  docs/                             # Руководства (RU)
+  tools/                            # Скрипты сборки/утилиты
 ```
 
 ---
 
-## Mesh Healer (CAD Mesh Import)
+## Mesh Healer (CAD‑импорт сеток)
 
-slice2solid can optionally run a **safe mesh repair** step after exporting the preview STL, producing `*_healed.stl`.
-The goal is to improve import success in CAD systems that support mesh bodies (watertight/manifold as much as possible), while avoiding remeshing/simplification that could destroy infill details.
+slice2solid умеет выполнять «лечение» сетки после экспорта STL, создавая `*_healed.stl`.
+Цель — повысить вероятность успешного импорта в CAD‑системы, которые поддерживают mesh‑тела (по возможности делая сетку более «watertight/manifold»),
+избегая ремешинга/упрощения, способного разрушить детали инфилла.
 
-### GUI (recommended)
+### GUI (рекомендуется)
 
-- Open the **`CAD / Геометрия`** tab
-- Enable **`Mesh Healer (CAD)`**
-- If the GUI process starts but no window appears (often after disconnecting a second monitor), run `python run_gui.py --reset-ui` to reset saved window geometry.
-- Preset: `safe` (default) or `aggressive`
-- Optional: enable JSON report to get before/after stats in a file next to the output STL
+- Вкладка `CAD / Геометрия` → блок `Mesh Healer (CAD)`
+- Профиль: `safe` (по умолчанию) или `aggressive`
+- Опционально можно включить JSON‑отчёт со статистикой до/после рядом с выходным STL
 
-Output files in the chosen output folder:
-- `*_s2s_preview_structure.stl` (original)
-- `*_s2s_preview_structure_healed.stl` (repaired)
-- `*_s2s_preview_structure_healed_report.json` (optional)
+Выходные файлы в папке результата:
+- `*_s2s_preview_structure.stl` (исходный)
+- `*_s2s_preview_structure_healed.stl` (исправленный)
+- `*_s2s_preview_structure_healed_report.json` (опционально)
 
 ### CLI (standalone heal)
 
-Run from repo root:
 - `python run_cli.py heal data/samples/smoke_preview_structure.stl --heal-preset safe --close-holes-max 2.0 --report heal_report.json`
 
-### Backend notes
+### Примечания по backend
 
-- Primary backend: `pymeshlab` (recommended; installed via `pip install pymeshlab`)
-- Fallback: `meshlabserver` (MeshLab CLI). An example filter script template is in `tools/meshlab/heal_safe_template.mlx`.
+- основной backend: `pymeshlab`
+- fallback: `meshlabserver` (MeshLab CLI), пример шаблона фильтра: `tools/meshlab/heal_safe_template.mlx`
 
-### Smoke test
+---
+
+## Документация
+
+- `TECHNICAL_SPECIFICATION_RU.md` — полное описание пайплайна, входов/выходов, преобразований координат и ограничений
+- `TECHNICAL_SPECIFICATION.md` — версия на английском
+- `docs/cad_import_guide_ru.md` — заметки по импорту mesh в CAD
+- `docs/installer_ru.md` — сборка `slice2solid.exe` и установщика для Windows
+
+---
+
+## Допущения и ограничения
+
+- пористость учитывается через эффективные свойства;
+- термические остаточные напряжения не моделируются;
+- материал внутри локальных областей считается однородным.
+
+---
+
+## Дальнейшая работа (Future Work)
+
+- поддержка дополнительных слайсеров;
+- экспорт в CAE‑готовые форматы и улучшение связки с Mechanical;
+- автоматизированное построение карт анизотропии для FEM;
+- межслойные когезионные модели и прогрессирующее разрушение;
+- учёт остаточных напряжений и многоматериальной печати.
+
+---
+
+## Проверка (smoke)
 
 - `python -m unittest discover -s tests -p "test_*.py"`
