@@ -15,7 +15,7 @@
   - заметки с подсказками по стартовым параметрам (spacing/resolution).
 - (Опционально) `*_healed.stl` и `*_healed_report.json` — результат `Mesh Healer` (если включён).
 
-## Типовой пайплайн (mesh → repair → STEP) в стороннем инструменте
+## Типовой пайплайн (mesh -> repair -> STEP) в стороннем инструменте
 
 1) Импортируйте mesh:
 - файл: `*_s2s_preview_structure.stl` (или `_mesh.ply`)
@@ -27,12 +27,12 @@
 - удаление мелкого мусора (islands), если вокруг есть артефакты.
 
 3) Если инструмент поддерживает конвертацию:
-- Convert mesh/implicit/volume → solid (B-Rep)
+- Convert mesh/implicit/volume -> solid (B-Rep)
 
 4) Экспортируйте CAD-формат:
 - `STEP` (или Parasolid/другой формат, который подходит вашему CAD)
 
-## Альтернатива: point cloud → implicit/volume → solid
+## Альтернатива: point cloud -> implicit/volume -> solid
 
 Для решёток/заполнений иногда лучше работать не с сеткой, а с point cloud:
 1) Импортируйте `voxel_points.csv` как список точек (формат: каждая строка `x,y,z`, без заголовка).
