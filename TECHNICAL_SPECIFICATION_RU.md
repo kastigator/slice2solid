@@ -97,7 +97,11 @@
 - `*_s2s_preview_structure_healed.stl` - (опционально) исправленная сетка для импорта в CAD как mesh.
 - `*_s2s_preview_structure_healed_report.json` - (опционально) отчёт до/после по сетке.
 - `*_s2s_preview_structure_mesh.ply` + `voxel_points.csv` + `cad_import_notes.txt` - (опционально) CAD bundle для внешних CAD/mesh-инструментов.
-- `ansys_layers.json`, `ansys_layers.csv`, `ansys_mechanical_import_layers.py` - (опционально) экспорт для ANSYS Mechanical.
+- `ansys_layers.json`, `ansys_layers.csv` — таблица слоёв/направлений укладки (для CAE).
+- `ansys_mechanical_import_layers.py` — путь A (legacy): попытка создать Named Selections/Coordinate Systems через Mechanical Scripting API.
+- `ansys_mapdl_layers.mac` — путь B (рекомендуется): MAPDL snippet для разбиения элементов по слоям (CM) и назначения ESYS по углу укладки.
+- `ansys_mapdl_layers_report.txt` — отчёт, создаваемый MAPDL snippet при решении (сколько элементов попало в каждый слой/группу).
+- `insight_part.sgm` — (опционально) извлечённый slice/group файл Insight для диагностики (из `*.sgm.gz` или архива в `ssys_*`).
 - `metadata.json` - метаданные запуска (параметры, матрица, оценки размеров/сеток и т.п.).
 
 ---

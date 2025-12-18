@@ -340,7 +340,13 @@ The project shall provide an **optional** automatic mesh repair stage applied **
 
 The project generates:
 - CAE-ready solid geometry (STL / STEP),
-- toolpath-derived material orientation data for ANSYS,
+- toolpath-derived material orientation data for ANSYS, including:
+  - `ansys_layers.json` / `ansys_layers.csv` (layer orientation table),
+  - `ansys_mapdl_layers.mac` (recommended, MAPDL path B: layer element components + ESYS assignment),
+  - `ansys_mapdl_layers_report.txt` (generated during solve by the MAPDL snippet; per-layer element counts),
+  - `ansys_mechanical_section_planes.py` (optional: Mechanical scripting helper to create a movable Section Plane and export per-layer slice images),
+  - `ansys_mechanical_import_layers.py` (legacy, path A: Mechanical scripting helper),
+  - `insight_part.sgm` (optional, extracted Insight slice/group file for diagnostics),
 - explicit infill geometry (optional),
  - diagnostic and statistical reports,
  - (optional) healed mesh `*_healed.stl` and a before/after JSON report (`*_healed_report.json`).

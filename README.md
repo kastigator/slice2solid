@@ -46,6 +46,13 @@ FDM-деталей по данным слайсинга **Stratasys Insight**.
 
 Стандартные CAD/CAE‑инструменты не решают эту задачу напрямую.
 
+ANSYS import options:
+- **Path B (recommended):** use the generated MAPDL snippet `ansys_mapdl_layers.mac` in Mechanical (`Static Structural → Environment → Commands`).
+- **Path A (legacy):** run `ansys_mechanical_import_layers.py` inside Mechanical (creates Named Selections/Coordinate Systems; may be less stable across versions).
+- Optional helper: run `ansys_mechanical_section_planes.py` inside Mechanical to create a movable Section Plane (and optionally export one PNG per layer for slicer-like comparison).
+
+Path B also writes `ansys_mapdl_layers_report.txt` during solve (per-layer element counts and orientation metadata) into the solver working directory.
+
 ---
 
 ## Решение: что делает slice2solid (Solution)
@@ -61,6 +68,8 @@ slice2solid восстанавливает представление FDM‑де
 ### 2) Геометрическая реконструкция (опционально)
 - явная реконструкция инфилла/периметров в виде mesh на основе траекторий;
 - подходит для визуализации, оценки массы/инерции и последующей конвертации во внешних CAD/mesh‑инструментах.
+
+When a job folder is provided, slice2solid also tries to extract Insight slice-geometry (`*.sgm.gz` or packaged `.sgm`) into `insight_part.sgm` for diagnostics.
 
 ---
 

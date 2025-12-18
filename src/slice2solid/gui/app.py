@@ -55,6 +55,7 @@ from slice2solid.core.insight_params import (
     infer_stl_path_from_job,
     load_job_params,
 )
+from slice2solid.core.insight_sgm import extract_sgm_to_folder
 from slice2solid.core.cae_orientation import compute_layer_orientations_toolpath
 from slice2solid.core.cad_bundle import export_voxel_centers_csv
 from slice2solid.core.voxelize import mesh_from_voxels_configured, voxelize_toolpath
@@ -334,6 +335,9 @@ class Worker(QtCore.QObject):
             out_layers_json = out_dir / "ansys_layers.json"
             out_layers_csv = out_dir / "ansys_layers.csv"
             out_ansys_script = out_dir / "ansys_mechanical_import_layers.py"
+            out_mapdl_script = out_dir / "ansys_mapdl_layers.mac"
+            out_section_planes_script = out_dir / "ansys_mechanical_section_planes.py"
+            out_insight_sgm = out_dir / "insight_part.sgm"
 
             outputs: list[str] = []
             bundle_written = False
@@ -447,6 +451,49 @@ class Worker(QtCore.QObject):
                 self.log.emit(f"Запись {out_ansys_script}…")
                 out_ansys_script.write_text(_render_ansys_mechanical_script(self.cfg), encoding="utf-8")
                 outputs.append(str(out_ansys_script))
+
+                # Preferred (path B): MAPDL snippet for layer components + ESYS assignment.
+                out_mapdl_script.write_text(
+                    _render_ansys_mapdl_script(
+                        layers=[
+                            {
+                                "layer_id": l.layer_id,
+                                "z_min": l.z_min,
+                                "z_max": l.z_max,
+                                "z_center": l.z_center,
+                                "dir_xyz": list(l.dir_xyz) if l.dir_xyz is not None else None,
+                                "angle_deg": l.angle_deg,
+                                "confidence": l.confidence,
+                                "segments_used": l.segments_used,
+                                "total_weight": l.total_weight,
+                            }
+                            for l in layers
+                        ],
+                        cfg=self.cfg,
+                    ),
+                    encoding="utf-8",
+                )
+                outputs.append(str(out_mapdl_script))
+
+                # Mechanical helper: create a Section Plane (and optionally export PNGs per layer).
+                out_section_planes_script.write_text(
+                    _render_ansys_mechanical_section_planes_script(self.cfg),
+                    encoding="utf-8",
+                )
+                outputs.append(str(out_section_planes_script))
+
+                # Optional: extract Insight SGM (slice geometry) for diagnostics / validation.
+                try:
+                    if self.cfg.job_dir and Path(self.cfg.job_dir).exists():
+                        extracted = extract_sgm_to_folder(self.cfg.job_dir, out_dir)
+                        if extracted is not None:
+                            try:
+                                out_insight_sgm.write_bytes(Path(extracted.extracted_path).read_bytes())
+                                outputs.append(str(out_insight_sgm))
+                            except Exception:
+                                outputs.append(str(extracted.extracted_path))
+                except Exception:
+                    pass
 
             meta = {
                 "inputs": asdict(self.cfg),
@@ -844,10 +891,62 @@ def _element_centroid(mesh, eid):
 def _create_named_selection_by_ids(model, name, ids):
     # Create a MeshElements selection and assign to a Named Selection.
     sel = ExtAPI.SelectionManager.CreateSelectionInfo(SelectionTypeEnum.MeshElements)
-    sel.Ids = list(ids)
-    ns = model.AddNamedSelection()
-    ns.Name = name
-    ns.Location = sel
+
+    # In some Mechanical/IronPython builds, direct assignment to `sel.Ids` can fail
+    # or produce opaque internal errors. Prefer mutating the underlying collection.
+    try:
+        if hasattr(sel, "Ids") and hasattr(sel.Ids, "Clear") and hasattr(sel.Ids, "Add"):
+            try:
+                sel.Ids.Clear()
+            except Exception:
+                pass
+            for _eid in ids:
+                try:
+                    sel.Ids.Add(int(_eid))
+                except Exception:
+                    pass
+        else:
+            sel.Ids = list(ids)
+    except Exception:
+        # Last-resort fallback.
+        try:
+            sel.Ids = list(ids)
+        except Exception:
+            pass
+    def _with_transaction(fn):
+        t = globals().get("Transaction", None)
+        if t is None:
+            return fn()
+        try:
+            with t():
+                return fn()
+        except Exception as e:
+            _log("WARN: Transaction wrapper failed:", e)
+            return fn()
+
+    # Defensive: some builds can throw opaque internal errors (e.g. ObjectState)
+    # when creating or scoping Named Selections. Prefer logging + skipping over hard crash.
+    try:
+        ns = _with_transaction(lambda: model.AddNamedSelection())
+    except Exception as e:
+        _log("ERROR: AddNamedSelection failed for", name, ":", e)
+        return None
+
+    if ns is None:
+        _log("ERROR: AddNamedSelection returned None for", name)
+        return None
+
+    try:
+        ns.Name = name
+    except Exception as e:
+        _log("WARN: failed to set NamedSelection.Name for", name, ":", e)
+
+    try:
+        ns.Location = sel
+    except Exception as e:
+        _log("ERROR: failed to set NamedSelection.Location for", name, ":", e)
+        return None
+
     return ns
 
 
@@ -1167,8 +1266,9 @@ def main():
         name = "L_{:04d}".format(lid0) if int(GROUP_SIZE_LAYERS) <= 1 else "L_{:04d}_{:04d}".format(lid0, lid1)
 
         if bool(CREATE_NAMED_SELECTIONS):
-            _create_named_selection_by_ids(model, name, band_eids)
-            created_ns += 1
+            ns = _create_named_selection_by_ids(model, name, band_eids)
+            if ns is not None:
+                created_ns += 1
 
         if bool(CREATE_COORDINATE_SYSTEMS):
             try:
@@ -1213,6 +1313,212 @@ main()
 '''
 
 
+_ANSYS_MAPDL_SCRIPT_TEMPLATE = r"""! slice2solid -> MAPDL layer helper (for Workbench Mechanical)
+!
+! Goal:
+! - Create element components per layer (or layer-group) by centroid Z
+! - Assign element coordinate systems (ESYS) per layer using in-plane toolpath angle
+! - Emit a small per-layer report (element counts, angle, confidence)
+!
+! How to use (Mechanical):
+! - Static Structural -> Environment -> Commands
+! - Paste this file contents, or use "Read Input File" if available in your version.
+!
+! Notes:
+! - Units follow your Mechanical model units (recommended: mm). This script uses Z ranges in mm.
+! - This avoids Mechanical API Named Selections (which can be unstable on some builds).
+! - This snippet temporarily enters /PREP7 and then returns to /SOLU so Mechanical can continue solving.
+!
+/PREP7
+CSYS,0
+!
+! Write a small CSV-like report next to solver working directory.
+*CFOPEN,ansys_mapdl_layers_report,txt
+*VWRITE,'name,zmin_mm,zmax_mm,nelem,angle_deg,confidence'
+(A)
+!
+! ---- CONFIG injected by slice2solid ----
+! MIN_CONFIDENCE: {min_conf}
+! GROUP_SIZE_LAYERS: {group_size}
+! CS_BASE_ID: {cs_base}
+!
+! ---- BEGIN LAYERS ----
+{layers_block}
+! ---- END LAYERS ----
+!
+ALLSEL,ALL
+CSYS,0
+*CFCLOS
+/SOLU
+"""
+
+
+_ANSYS_MECHANICAL_SECTION_PLANES_TEMPLATE = r"""# -*- coding: utf-8 -*-
+# slice2solid: Mechanical helper (Section Planes)
+#
+# What it does:
+# - Creates (or reuses) a single active Section Plane named 'S2S_Slice'
+# - Moves it to a requested Z (mm)
+# - Optional: exports one PNG per layer for comparison with slicer
+#
+# How to use (Mechanical):
+# - Automation -> Scripting -> Open Script... -> select this file -> Run
+# - Edit Z_MM / EXPORT_IMAGES below and re-run as needed
+
+import csv
+import os
+
+from Ansys.Mechanical.Graphics import GraphicsImageExportFormat, GraphicsImageExportSettings
+from Ansys.Mechanical.Graphics import Point, SectionPlane, SectionPlaneType, Vector3D
+
+
+HERE = os.path.dirname(__file__)
+LAYERS_CSV = os.path.join(HERE, "ansys_layers.csv")
+
+# User knobs
+Z_MM = {z_mm:.6f}  # move slice here (mm)
+EXPORT_IMAGES = {export_images}  # True to export a PNG per layer
+EXPORT_DIR = os.path.join(HERE, "s2s_slices_png")
+PLANE_NAME = "S2S_Slice"
+
+
+def _load_layers_csv(path):
+    layers = []
+    with open(path, "r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            lid = int(row[\"layer_id\"])
+            zmin = float(row[\"z_min_mm\"])
+            zmax = float(row[\"z_max_mm\"])
+            layers.append((lid, zmin, zmax))
+    return layers
+
+
+def _get_or_create_plane(name):
+    for p in Graphics.SectionPlanes:
+        try:
+            if p.Name == name:
+                p.Active = True
+                return p
+        except Exception:
+            pass
+
+    sp = SectionPlane()
+    sp.Name = name
+    sp.Active = True
+    sp.Type = SectionPlaneType.AgainstDirection
+    sp.Direction = Vector3D(0, 0, 1)
+    sp.Center = Point([0.0, 0.0, 0.0], \"mm\")
+    Graphics.SectionPlanes.Add(sp)
+    return sp
+
+
+def _set_plane_z(plane, z_mm):
+    plane.Center = Point([0.0, 0.0, float(z_mm)], \"mm\")
+
+
+def _export_png(path):
+    settings = GraphicsImageExportSettings()
+    settings.Width = 1600
+    settings.Height = 900
+    settings.CurrentGraphicsDisplay = True
+    Graphics.ExportImage(path, GraphicsImageExportFormat.PNG, settings)
+
+
+plane = _get_or_create_plane(PLANE_NAME)
+_set_plane_z(plane, Z_MM)
+
+if EXPORT_IMAGES:
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    layers = _load_layers_csv(LAYERS_CSV)
+    for lid, zmin, zmax in layers:
+        zmid = 0.5 * (zmin + zmax)
+        _set_plane_z(plane, zmid)
+        out = os.path.join(EXPORT_DIR, f\"slice_L_{lid:04d}_z{zmid:.3f}mm.png\")
+        _export_png(out)
+
+print(f\"S2S: Section plane '{PLANE_NAME}' set to Z={Z_MM} mm\")  # noqa: T201
+"""
+
+
+def _render_ansys_mapdl_script(*, layers: list[dict[str, object]], cfg: JobConfig) -> str:
+    min_conf = float(cfg.ansys_min_confidence)
+    group_size = int(cfg.ansys_group_size_layers) if int(cfg.ansys_group_size_layers) > 0 else 1
+    cs_base = 1000  # avoid conflicts with user-defined CS
+
+    def _grouped() -> list[tuple[int, int, float, float, float | None, float, float]]:
+        groups: dict[int, list[dict[str, object]]] = {}
+        if group_size <= 1:
+            for l in layers:
+                gid = int(l.get("layer_id", 0) or 0)
+                groups.setdefault(gid, []).append(l)
+        else:
+            for l in layers:
+                lid = int(l.get("layer_id", 0) or 0)
+                gid = lid // group_size
+                groups.setdefault(gid, []).append(l)
+
+        out: list[tuple[int, int, float, float, float | None, float, float]] = []
+        for gid in sorted(groups.keys()):
+            gl = groups[gid]
+            lids = [int(x.get("layer_id", 0) or 0) for x in gl]
+            lid0 = min(lids) if lids else int(gid)
+            lid1 = max(lids) if lids else int(gid)
+            zmin = min(float(x.get("z_min", 0.0) or 0.0) for x in gl)
+            zmax = max(float(x.get("z_max", 0.0) or 0.0) for x in gl)
+
+            best_angle = None
+            best_key = None
+            best_conf = 0.0
+            best_w = 0.0
+            for x in gl:
+                conf = float(x.get("confidence", 0.0) or 0.0)
+                w = float(x.get("total_weight", 0.0) or 0.0)
+                a = x.get("angle_deg", None)
+                if a is None:
+                    continue
+                key = (conf, w)
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_angle = float(a)
+                    best_conf = conf
+                    best_w = w
+
+            out.append((lid0, lid1, zmin, zmax, best_angle, best_conf, best_w))
+        return out
+
+    lines: list[str] = []
+    lines.append("! Each block: select elements by centroid Z; create CM; optionally set ESYS.")
+    for i, (lid0, lid1, zmin, zmax, angle, conf, w) in enumerate(_grouped()):
+        name = f"L_{lid0:04d}" if group_size <= 1 else f"L_{lid0:04d}_{lid1:04d}"
+        csid = cs_base + i
+        a_out = float(angle) if angle is not None else 0.0
+        conf_out = float(conf)
+        lines.append("! ---- " + name + " ----")
+        lines.append("ALLSEL,ALL")
+        lines.append(f"ESEL,S,CENT,Z,{zmin:.6f},{max(zmin, zmax - 1e-9):.6f}")
+        lines.append("*GET,S2S_NELEM,ELEM,0,COUNT")
+        lines.append(f"CM,{name},ELEM")
+        lines.append(f"*SET,S2S_NAME,'{name}'")
+        lines.append(f"*VWRITE,S2S_NAME,{zmin:.6f},{zmax:.6f},S2S_NELEM,{a_out:.6f},{conf_out:.6f}")
+        lines.append("(A20,',',F12.6,',',F12.6,',',I10,',',F10.4,',',F8.6)")
+        lines.append(f"/COM, S2S {name}  Z={zmin:.6f}..{zmax:.6f}  (see ansys_mapdl_layers_report.txt)")
+
+        if angle is not None and float(conf) >= float(min_conf):
+            lines.append(f"! angle_deg={float(angle):.6f} conf={float(conf):.6f} weight={float(w):.6f}")
+            lines.append(f"LOCAL,{csid},0,0,0,0,{float(angle):.6f},0,0")
+            lines.append(f"EMODIF,ALL,ESYS,{csid}")
+        else:
+            lines.append(f"! No ESYS assigned (angle missing or conf<{min_conf:.3f}). conf={float(conf):.6f}")
+
+    return _ANSYS_MAPDL_SCRIPT_TEMPLATE.format(
+        min_conf=f"{min_conf:.6g}",
+        group_size=str(group_size),
+        cs_base=str(cs_base),
+        layers_block="\n".join(lines),
+    )
+
+
 def _render_ansys_mechanical_script(cfg: JobConfig) -> str:
     header = (
         "# -*- coding: utf-8 -*-\n"
@@ -1224,6 +1530,12 @@ def _render_ansys_mechanical_script(cfg: JobConfig) -> str:
         "\n"
     )
     return header + _ANSYS_MECHANICAL_SCRIPT_TEMPLATE
+
+
+def _render_ansys_mechanical_section_planes_script(cfg: JobConfig) -> str:
+    # Default: Z=0 mm (user can edit Z_MM in the script).
+    z_mm = 0.0
+    return _ANSYS_MECHANICAL_SECTION_PLANES_TEMPLATE.format(z_mm=z_mm, export_images="False")
 
 
 def _safe_filename_stem(name: str) -> str:
@@ -1963,7 +2275,7 @@ _HELP_HTML = """
 
 <h3>4) Вкладка “ANSYS / CAE”</h3>
 <ul>
-  <li>Выход: <code>ansys_layers.json</code>, <code>ansys_layers.csv</code>, <code>ansys_mechanical_import_layers.py</code>.</li>
+  <li>Выход: <code>ansys_layers.json</code>, <code>ansys_layers.csv</code>, <code>ansys_mechanical_import_layers.py</code>, <code>ansys_mapdl_layers.mac</code>.</li>
   <li>Идея: назначить ортотропию по слоям (X вдоль печати, Z — build direction).</li>
   <li><b>Пресеты</b> на вкладке ANSYS меняют параметры генерируемого Mechanical-скрипта (группировка слоёв, порог confidence, создавать ли NS/CS).</li>
 </ul>
@@ -2413,7 +2725,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         ansys_intro = QtWidgets.QLabel(
             "Режим ANSYS: экспорт ориентации печати по слоям для назначения ортотропии в Mechanical.\n"
-            "Выход: ansys_layers.json/csv + ansys_mechanical_import_layers.py."
+            "Выход: ansys_layers.json/csv + ansys_mechanical_import_layers.py + ansys_mapdl_layers.mac."
         )
         ansys_intro.setWordWrap(True)
         ansys_layout.addWidget(ansys_intro)
@@ -2511,7 +2823,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "ANSYS Mechanical:\n"
             "1) Импортируйте геометрию, сгенерируйте mesh.\n"
             "2) Mechanical → Automation → Scripting → Run Script…\n"
-            "3) Запустите ansys_mechanical_import_layers.py из папки результата.\n"
+            "3) Для пути A: запустите ansys_mechanical_import_layers.py из папки результата.\n"
+            "   Для пути B (рекомендуется): вставьте ansys_mapdl_layers.mac в Static Structural → Environment → Commands.\n"
         )
         ansys_hint.setWordWrap(True)
         ansys_layout.addWidget(ansys_hint)
@@ -3014,7 +3327,7 @@ class MainWindow(QtWidgets.QMainWindow):
             " - Для CAE (ANSYS): обычно берут геометрию детали (placed STL или CAD-solid) + ansys_layers.*\n"
             " - *_s2s_preview_structure.stl (если включён экспорт геометрии)\n"
             " - metadata.json (параметры/матрица/статистика)\n"
-            " - ansys_layers.json/csv + ansys_mechanical_import_layers.py (если включён экспорт ANSYS)\n"
+            " - ansys_layers.json/csv + ansys_mechanical_import_layers.py + ansys_mapdl_layers.mac (если включён экспорт ANSYS)\n"
             " - *_s2s_preview_structure_mesh.ply, voxel_points.csv, cad_import_notes.txt (если включён CAD bundle)\n\n"
             " - *_healed.stl (+ *_healed_report.json), если включён Mesh Healer (CAD)\n\n"
             "Подробности: вкладка 'Справка' и docs/cad_import_guide_ru.md."
