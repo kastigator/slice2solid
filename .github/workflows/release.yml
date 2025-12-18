@@ -1,0 +1,49 @@
+name: Release (Windows installer)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+
+      - name: Verify tag matches __version__
+        shell: powershell
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $tagVer = $tag.TrimStart('v')
+
+          $matchInfo = Select-String -Path 'src\slice2solid\__init__.py' -Pattern '^__version__\s*=\s*"([^"]+)"' -AllMatches | Select-Object -First 1
+          if (-not $matchInfo) { throw "Could not find __version__ in src\\slice2solid\\__init__.py" }
+          $ver = $matchInfo.Matches[0].Groups[1].Value.Trim()
+
+          if ($ver -ne $tagVer) { throw "Tag version ($tagVer) != __version__ ($ver)" }
+          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build installer
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\build_installer.ps1
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: tools/installer/Output/slice2solid-setup-v${{ env.VERSION }}.exe

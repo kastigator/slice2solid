@@ -18,7 +18,7 @@ FDM-деталей по данным слайсинга **Stratasys Insight**.
 ## Скачать и установить (Windows)
 
 1) Откройте страницу релизов: [Releases](../../releases/latest)
-2) В разделе Assets скачайте `slice2solid-setup.exe`
+2) В разделе Assets скачайте `slice2solid-setup-vX.Y.Z.exe`
 3) Запустите установщик (если Windows SmartScreen ругается — нажмите “More info” → “Run anyway”)
 
 Если в релизах ещё нет готового установщика, соберите его из исходников по инструкции `docs/installer_ru.md`.

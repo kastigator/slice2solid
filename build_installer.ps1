@@ -3,11 +3,6 @@ $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# Builds a GUI app folder + optional installer. CLI entrypoint is `run_cli.py`.
-if (!(Test-Path ".\\.venv\\Scripts\\python.exe")) {
-  throw "Virtualenv not found at .venv. Create it first (python -m venv .venv) and install requirements."
-}
-
 function Invoke-External {
   param(
     [Parameter(Mandatory = $true)][string]$FilePath,
@@ -37,6 +32,15 @@ function Remove-TreeWithRetry {
   }
   if (Test-Path $Path) {
     throw "Could not remove '$Path' (likely locked by another process). Close slice2solid / Explorer preview / antivirus scan and retry."
+  }
+}
+
+# Builds a GUI app folder + optional installer. CLI entrypoint is `run_cli.py`.
+if (!(Test-Path ".\\.venv\\Scripts\\python.exe")) {
+  Write-Host "Virtualenv not found at .venv; creating it..."
+  Invoke-External python -m venv .venv
+  if (!(Test-Path ".\\.venv\\Scripts\\python.exe")) {
+    throw "Failed to create virtualenv at .venv"
   }
 }
 
@@ -97,15 +101,17 @@ if (-not $iscc) {
 
 if ($appVersion) {
   Write-Host "Building installer with AppVersion=$appVersion"
-  $outExe = "tools\\installer\\Output\\slice2solid-setup.exe"
-  if (Test-Path $outExe) {
+  $outDir = "tools\\installer\\Output"
+  $outExe = Join-Path $outDir "slice2solid-setup-v$appVersion.exe"
+  if (Test-Path $outDir) {
     try {
-      Remove-Item -Force $outExe -ErrorAction Stop
+      Get-ChildItem -Path $outDir -Filter "slice2solid-setup*.exe" -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction Stop
     } catch {
-      throw "Cannot overwrite '$outExe' (locked). Close any running installer/app, then retry."
+      throw "Cannot clean '$outDir' (locked). Close any running installer/app, then retry."
     }
   }
   Invoke-External $iscc "/DAppVersion=$appVersion" "tools\\installer\\slice2solid.iss" | Out-Host
+  if (!(Test-Path $outExe)) { throw "Installer not found at expected path: $outExe" }
 } else {
   Invoke-External $iscc "tools\\installer\\slice2solid.iss" | Out-Host
 }

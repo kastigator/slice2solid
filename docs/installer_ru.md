@@ -6,7 +6,7 @@
 - `dist_exe\\slice2solid\\slice2solid.exe` и рядом нужные DLL/пакеты.
 
 2) **Установщик (Inno Setup)**:
-- `tools\\installer\\Output\\slice2solid-setup.exe`
+- `tools\\installer\\Output\\slice2solid-setup-vX.Y.Z.exe`
 - при запуске он:
   - копирует файлы в `C:\\Program Files\\slice2solid\\`
   - создаёт пункт в меню Пуск
@@ -36,3 +36,13 @@
 - `build_installer.ps1` передаёт эту версию в Inno Setup как `AppVersion`, чтобы инсталлятор не «отставал» от кода.
 - Инсталлятор пакует **`--onedir`** сборку из `dist_exe\\slice2solid\\...` (см. `tools\\installer\\slice2solid.iss`).
 - При проверке не путайте, откуда запускаете программу: меню Пуск/`Program Files` (установленная версия) vs `dist_exe\\...` (локальная сборка). Если сомневаетесь — удалите старую установку через “Apps & Features” и установите заново.
+
+## Публикация релиза (GitHub)
+
+В репозитории настроен GitHub Actions workflow, который собирает установщик и прикрепляет его к GitHub Release при пуше тега `vX.Y.Z`.
+
+1) Обновите `__version__` в `src\\slice2solid\\__init__.py`
+2) Создайте тег и отправьте его в GitHub:
+- `git tag vX.Y.Z`
+- `git push origin vX.Y.Z`
+3) Дождитесь завершения workflow “Release (Windows installer)” и скачайте установщик из `Releases`.

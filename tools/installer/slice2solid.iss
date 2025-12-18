@@ -22,7 +22,8 @@ AppUpdatesURL={#AppURL}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
-OutputBaseFilename={#AppName}-setup
+; Avoid overwriting old installers and make Releases assets self-descriptive.
+OutputBaseFilename={#AppName}-setup-v{#AppVersion}
 Compression=lzma
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
