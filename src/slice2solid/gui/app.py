@@ -19,12 +19,29 @@ try:  # optional: 3D preview
 except Exception:  # pragma: no cover
     gl = None
 
-try:  # optional: high-quality 3D preview (VTK)
-    import pyvista as pv
-    from pyvistaqt import QtInteractor
-except Exception:  # pragma: no cover
-    pv = None
-    QtInteractor = None
+pv = None
+QtInteractor = None
+_PYVISTA_IMPORT_ERROR: Exception | None = None
+
+
+def _lazy_import_pyvista() -> bool:
+    global pv, QtInteractor, _PYVISTA_IMPORT_ERROR
+    if pv is not None and QtInteractor is not None:
+        return True
+    if _PYVISTA_IMPORT_ERROR is not None:
+        return False
+    try:  # optional: high-quality 3D preview (VTK)
+        import pyvista as _pv
+        from pyvistaqt import QtInteractor as _QtInteractor
+
+        pv = _pv
+        QtInteractor = _QtInteractor
+        return True
+    except Exception as e:  # pragma: no cover
+        _PYVISTA_IMPORT_ERROR = e
+        pv = None
+        QtInteractor = None
+        return False
 
 from slice2solid.core.insight_simulation import (
     invert_rowvec_matrix,
@@ -1731,7 +1748,7 @@ class MeshCompareWidget(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         backend = os.environ.get("S2S_PREVIEW_BACKEND", "auto").strip().lower()
         if backend == "vtk":
-            view_cls = _MeshVTKView if (pv is not None and QtInteractor is not None) else _Mesh2DView
+            view_cls = _MeshVTKView if _lazy_import_pyvista() else _Mesh2DView
         elif backend == "gl":
             view_cls = _Mesh3DView if gl is not None else _Mesh2DView
         elif backend == "2d":
@@ -1740,7 +1757,7 @@ class MeshCompareWidget(QtWidgets.QWidget):
             # Default to pyqtgraph OpenGL when available: it's typically more robust than VTK in Qt layouts.
             if gl is not None:
                 view_cls = _Mesh3DView
-            elif pv is not None and QtInteractor is not None:
+            elif _lazy_import_pyvista():
                 view_cls = _MeshVTKView
             else:
                 view_cls = _Mesh2DView
@@ -2603,10 +2620,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.about_btn.clicked.connect(self._show_about)
         self.howto_btn.clicked.connect(self._show_help)
         self.preview_open_folder_btn.clicked.connect(self._open_output_folder)
-        self.preview_reload_btn.clicked.connect(self._load_last_run_from_output_dir)
+        self.preview_reload_btn.clicked.connect(lambda: self._load_last_run_from_output_dir(load_meshes=True))
         self.preview_open_after_btn.clicked.connect(self._open_preview_after)
         self.preview_open_before_btn.clicked.connect(self._open_preview_before)
-        self.out_edit.editingFinished.connect(self._load_last_run_from_output_dir)
+        self.out_edit.editingFinished.connect(lambda: self._load_last_run_from_output_dir(load_meshes=False))
 
         # If user edits any parameter manually -> switch preset to Custom.
         for w in (
@@ -2704,7 +2721,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.out_edit.setText(out)
         except Exception:
             return
-        self._load_last_run_from_output_dir()
+        self._load_last_run_from_output_dir(load_meshes=False)
 
     def _update_preview_buttons(self) -> None:
         self.preview_open_before_btn.setEnabled(bool(self._preview_before_path))
@@ -2726,7 +2743,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def _load_last_run_from_output_dir(self) -> None:
+    def _load_last_run_from_output_dir(self, *, load_meshes: bool) -> None:
         out = self.out_edit.text().strip()
         if not out:
             return
@@ -2788,7 +2805,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_after_path = after_path
         self._update_preview_buttons()
 
-        if after_path is None:
+        if not load_meshes or after_path is None:
             return
         try:
             after_mesh = trimesh.load_mesh(after_path, force="mesh")
@@ -3261,7 +3278,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if isinstance(outputs, list):
             self._set_outputs([str(x) for x in outputs])
-            self._load_last_run_from_output_dir()
+            # Keep preview snappy: we already have meshes in-memory via `_update_preview`.
+            self._load_last_run_from_output_dir(load_meshes=False)
         self.open_out_btn.setEnabled(True)
 
     def _show_about(self) -> None:
