@@ -15,6 +15,16 @@ FDM-деталей по данным слайсинга **Stratasys Insight**.
 
 ---
 
+## Скачать и установить (Windows)
+
+1) Откройте страницу релизов: [Releases](../../releases/latest)
+2) В разделе Assets скачайте `slice2solid-setup.exe`
+3) Запустите установщик (если Windows SmartScreen ругается — нажмите “More info” → “Run anyway”)
+
+Если в релизах ещё нет готового установщика, соберите его из исходников по инструкции `docs/installer_ru.md`.
+
+---
+
 ## Контекст проекта (Project Background)
 
 Проект разработан в рамках исследовательской работы, связанной с ауксетическими и решётчатыми (lattice)
@@ -191,7 +201,7 @@ slice2solid умеет выполнять «лечение» сетки посл
 - `TECHNICAL_SPECIFICATION_RU.md` — полное описание пайплайна, входов/выходов, преобразований координат и ограничений
 - `TECHNICAL_SPECIFICATION.md` — версия на английском
 - `docs/cad_import_guide_ru.md` — заметки по импорту mesh в CAD
-- `docs/installer_ru.md` — сборка `slice2solid.exe` и установщика для Windows
+- `docs/installer_ru.md` — сборка установщика для Windows
 
 ---
 

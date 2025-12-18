@@ -8,21 +8,55 @@ if (!(Test-Path ".\\.venv\\Scripts\\python.exe")) {
   throw "Virtualenv not found at .venv. Create it first (python -m venv .venv) and install requirements."
 }
 
+function Invoke-External {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments
+  )
+  & $FilePath @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "Command failed (exit code $LASTEXITCODE): $FilePath $($Arguments -join ' ')"
+  }
+}
+
+function Remove-TreeWithRetry {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [int]$Retries = 6,
+    [int]$SleepMs = 500
+  )
+  if (!(Test-Path $Path)) { return }
+  for ($i = 1; $i -le $Retries; $i++) {
+    try {
+      Remove-Item -Recurse -Force $Path -ErrorAction Stop
+      break
+    } catch {
+      if ($i -eq $Retries) { throw }
+      Start-Sleep -Milliseconds $SleepMs
+    }
+  }
+  if (Test-Path $Path) {
+    throw "Could not remove '$Path' (likely locked by another process). Close slice2solid / Explorer preview / antivirus scan and retry."
+  }
+}
+
 & .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt | Out-Host
 & .\\.venv\\Scripts\\python.exe -m pip install pyinstaller | Out-Host
 
 $work = ".\\build_exe"
 $dist = ".\\dist_exe"
+$versionFile = ".\\src\\slice2solid\\__init__.py"
+$appVersion = $null
+if (Test-Path $versionFile) {
+  $matchInfo = Select-String -Path $versionFile -Pattern '^__version__\s*=\s*"([^"]+)"' -AllMatches | Select-Object -First 1
+  if ($matchInfo -and $matchInfo.Matches.Count -gt 0) { $appVersion = $matchInfo.Matches[0].Groups[1].Value.Trim() }
+}
 
-if (Test-Path $work) {
-  try { Remove-Item -Recurse -Force $work } catch { Write-Host "Warning: could not remove $work ($_)"; }
-}
-if (Test-Path $dist) {
-  try { Remove-Item -Recurse -Force $dist } catch { Write-Host "Warning: could not remove $dist ($_)"; }
-}
+Remove-TreeWithRetry -Path $work
+Remove-TreeWithRetry -Path $dist
 
 # Build an onedir distribution (folder) - better for packaging DLL-heavy deps.
-& .\\.venv\\Scripts\\pyinstaller.exe `
+Invoke-External .\\.venv\\Scripts\\pyinstaller.exe `
   --noconfirm `
   --onedir `
   --windowed `
@@ -61,5 +95,18 @@ if (-not $iscc) {
   exit 0
 }
 
-& $iscc "tools\\installer\\slice2solid.iss" | Out-Host
+if ($appVersion) {
+  Write-Host "Building installer with AppVersion=$appVersion"
+  $outExe = "tools\\installer\\Output\\slice2solid-setup.exe"
+  if (Test-Path $outExe) {
+    try {
+      Remove-Item -Force $outExe -ErrorAction Stop
+    } catch {
+      throw "Cannot overwrite '$outExe' (locked). Close any running installer/app, then retry."
+    }
+  }
+  Invoke-External $iscc "/DAppVersion=$appVersion" "tools\\installer\\slice2solid.iss" | Out-Host
+} else {
+  Invoke-External $iscc "tools\\installer\\slice2solid.iss" | Out-Host
+}
 Write-Host "Installer built (see OutputBaseFilename in tools\\installer\\slice2solid.iss)."
