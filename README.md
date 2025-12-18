@@ -108,6 +108,7 @@ The goal is to improve import success in CAD systems that support mesh bodies (w
 
 - Open the **`CAD / Геометрия`** tab
 - Enable **`Mesh Healer (CAD)`**
+- If the GUI process starts but no window appears (often after disconnecting a second monitor), run `python run_gui.py --reset-ui` to reset saved window geometry.
 - Preset: `safe` (default) or `aggressive`
 - Optional: enable JSON report to get before/after stats in a file next to the output STL
 

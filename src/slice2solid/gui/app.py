@@ -4,6 +4,7 @@ import html
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import asdict, dataclass
 from importlib import resources
@@ -2634,6 +2635,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_step_widgets()
         self._update_preview_buttons()
 
+    def ensure_visible_on_screen(self) -> None:
+        try:
+            screens = QtGui.QGuiApplication.screens()
+            if not screens:
+                return
+
+            frame = self.frameGeometry()
+            if frame.isNull():
+                return
+
+            for s in screens:
+                if s.availableGeometry().intersects(frame):
+                    return
+
+            primary = QtGui.QGuiApplication.primaryScreen() or screens[0]
+            avail = primary.availableGeometry()
+            margin = 40
+
+            width = min(max(frame.width(), 920), max(320, avail.width() - margin * 2))
+            height = min(max(frame.height(), 640), max(240, avail.height() - margin * 2))
+            self.resize(width, height)
+
+            center = avail.center()
+            self.move(center.x() - self.width() // 2, center.y() - self.height() // 2)
+
+            self.setWindowState(
+                (self.windowState() & ~QtCore.Qt.WindowState.WindowMinimized) | QtCore.Qt.WindowState.WindowActive
+            )
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            return
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         try:
             self._settings.setValue("window/geometry", self.saveGeometry())
@@ -3270,17 +3304,33 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
 
-def main() -> None:
-    app = QtWidgets.QApplication([])
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    app = QtWidgets.QApplication(sys.argv)
     try:
         app.setOrganizationName(ORGANIZATION or "slice2solid")
         app.setApplicationName(APP_DISPLAY_NAME or "slice2solid")
     except Exception:
         pass
+
+    if "--reset-ui" in argv or os.environ.get("S2S_RESET_UI") == "1":
+        try:
+            settings = QtCore.QSettings()
+            settings.clear()
+            settings.sync()
+        except Exception:
+            pass
     w = MainWindow()
     w.show()
-    app.exec()
+    try:
+        app.processEvents()
+        w.ensure_visible_on_screen()
+    except Exception:
+        pass
+    return int(app.exec())
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
