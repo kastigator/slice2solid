@@ -194,6 +194,7 @@ cython_debug/
 
 # Inno Setup build outputs (project-specific)
 tools/installer/Output/
+tools/installer/slice2solid.ico
 
 # Ruff stuff:
 .ruff_cache/

@@ -28,6 +28,9 @@
 Если Inno Setup не установлен, установите его и соберите вручную:
 - `iscc.exe tools\\installer\\slice2solid.iss`
 
+Примечание: иконка установщика/приложения (`tools\\installer\\slice2solid.ico`) генерируется автоматически в `build_installer.ps1`. Если вы запускаете `iscc.exe` вручную, предварительно выполните:
+- `python tools\\generate_windows_icon.py`
+
 Если сборка падает с `WinError 32` / “file is being used by another process” — обычно это значит, что запущен `slice2solid.exe` (или его держит Проводник/антивирус). Закройте приложение и повторите сборку.
 
 ## Про версии и «почему запускается старая сборка»

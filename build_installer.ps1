@@ -47,6 +47,10 @@ if (!(Test-Path ".\\.venv\\Scripts\\python.exe")) {
 & .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt | Out-Host
 & .\\.venv\\Scripts\\python.exe -m pip install pyinstaller | Out-Host
 
+# Generate a proper Windows .ico (avoid the default Python icon).
+$iconPath = "tools\\installer\\slice2solid.ico"
+Invoke-External .\\.venv\\Scripts\\python.exe "tools\\generate_windows_icon.py" "--out" $iconPath
+
 $work = ".\\build_exe"
 $dist = ".\\dist_exe"
 $versionFile = ".\\src\\slice2solid\\__init__.py"
@@ -65,6 +69,7 @@ Invoke-External .\\.venv\\Scripts\\pyinstaller.exe `
   --onedir `
   --windowed `
   --name slice2solid `
+  --icon $iconPath `
   --workpath $work `
   --distpath $dist `
   --paths src `

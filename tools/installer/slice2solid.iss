@@ -24,6 +24,7 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 ; Avoid overwriting old installers and make Releases assets self-descriptive.
 OutputBaseFilename={#AppName}-setup-v{#AppVersion}
+SetupIconFile=slice2solid.ico
 Compression=lzma
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
