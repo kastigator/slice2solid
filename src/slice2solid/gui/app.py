@@ -1434,10 +1434,10 @@ if EXPORT_IMAGES:
     for lid, zmin, zmax in layers:
         zmid = 0.5 * (zmin + zmax)
         _set_plane_z(plane, zmid)
-        out = os.path.join(EXPORT_DIR, f\"slice_L_{lid:04d}_z{zmid:.3f}mm.png\")
+        out = os.path.join(EXPORT_DIR, f\"slice_L_{{lid:04d}}_z{{zmid:.3f}}mm.png\")
         _export_png(out)
 
-print(f\"S2S: Section plane '{PLANE_NAME}' set to Z={Z_MM} mm\")  # noqa: T201
+print(\"S2S: Section plane '%s' set to Z=%s mm\" % (PLANE_NAME, Z_MM))  # noqa: T201
 """
 
 
