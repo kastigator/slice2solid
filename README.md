@@ -28,7 +28,7 @@ FDM-деталей по данным слайсинга **Stratasys Insight**.
 ## Контекст проекта (Project Background)
 
 Проект разработан в рамках исследовательской работы, связанной с ауксетическими и решётчатыми (lattice)
-структурами, изготавливаемыми промышленной FDM‑печатью.
+структурами, изготавливаемыми промышленной FDM-печатью.
 
 Промышленные принтеры Stratasys широко используются в лабораториях и на предприятиях, однако
 проприетарный слайсер **Stratasys Insight** не предоставляет средств для восстановления фактической внутренней геометрии
@@ -39,49 +39,47 @@ FDM-деталей по данным слайсинга **Stratasys Insight**.
 ## Постановка проблемы (Problem Statement)
 
 После слайсинга в Stratasys Insight:
-- фактическая внутренняя структура детали теряется для CAD/CAE‑систем;
-- невозможно выполнить корректный FEM‑анализ с учётом геометрии инфилла;
-- анизотропия, присущая FDM‑печати, не может быть адекватно учтена;
-- восстановленная геометрия не переиспользуется в CAD‑сборках.
+- фактическая внутренняя структура детали теряется для CAD/CAE-систем;
+- невозможно выполнить корректный FEM-анализ с учётом геометрии инфилла;
+- анизотропия, присущая FDM-печати, не может быть адекватно учтена;
+- восстановленная геометрия не переиспользуется в CAD-сборках.
 
-Стандартные CAD/CAE‑инструменты не решают эту задачу напрямую.
+Стандартные CAD/CAE-инструменты не решают эту задачу напрямую.
 
-ANSYS import options:
-- **Path B (recommended):** use the generated MAPDL snippet `ansys_mapdl_layers.mac` in Mechanical (`Static Structural → Environment → Commands`).
-- **Path A (legacy):** run `ansys_mechanical_import_layers.py` inside Mechanical (creates Named Selections/Coordinate Systems; may be less stable across versions).
-- Optional helper: run `ansys_mechanical_section_planes.py` inside Mechanical to create a movable Section Plane (and optionally export one PNG per layer for slicer-like comparison).
+ANSYS Mechanical:
+- запускайте `CAE/ansys_mechanical_import_layers.py` (создаёт Named Selections/Coordinate Systems по слоям);
+- для визуальной проверки по высоте: `CAE/ansys_mechanical_section_planes.py` (Section Plane по Z и опциональный экспорт PNG по слоям).
 
-Path B also writes `ansys_mapdl_layers_report.txt` during solve (per-layer element counts and orientation metadata) into the solver working directory.
 
 ---
 
 ## Решение: что делает slice2solid (Solution)
 
-slice2solid восстанавливает представление FDM‑детали **после** слайсинга в Stratasys Insight на основе экспортов слайсера.
+slice2solid восстанавливает представление FDM-детали **после** слайсинга в Stratasys Insight на основе экспортов слайсера.
 Инструмент поддерживает два режима, использующих одни и те же входные данные:
 
-### 1) CAE‑представление (основной режим)
+### 1) CAE-представление (основной режим)
 - гладкая замкнутая геометрия по `placed STL`;
 - учёт структуры печати через анизотропные свойства и ориентации по траекториям;
 - экспорт данных ориентаций/слоёв для ANSYS Mechanical.
 
 ### 2) Геометрическая реконструкция (опционально)
 - явная реконструкция инфилла/периметров в виде mesh на основе траекторий;
-- подходит для визуализации, оценки массы/инерции и последующей конвертации во внешних CAD/mesh‑инструментах.
+- подходит для визуализации, оценки массы/инерции и последующей конвертации во внешних CAD и инструментах работы с сеткой (mesh).
 
-When a job folder is provided, slice2solid also tries to extract Insight slice-geometry (`*.sgm.gz` or packaged `.sgm`) into `insight_part.sgm` for diagnostics.
+Если выбрана папка задания, slice2solid также пытается извлечь геометрию слоёв Insight (`*.sgm.gz` или упакованный `.sgm`) в `insight_part.sgm` для диагностики.
 
 ---
 
 ## Промышленная значимость (Industrial Relevance)
 
-Stratasys‑принтеры активно используются в промышленности и университетах, при этом инженерным подразделениям часто
-не хватает инструмента, позволяющего выполнить корректный пост‑процессинг и анализ деталей со сложной внутренней структурой.
+Stratasys-принтеры активно используются в промышленности и университетах, при этом инженерным подразделениям часто
+не хватает инструмента, позволяющего выполнить корректный пост-процессинг и анализ деталей со сложной внутренней структурой.
 
 slice2solid позволяет:
 - готовить данные для механических расчётов с учётом структуры печати;
 - оценивать массу/жёсткость с учётом траекторий/заполнения;
-- переиспользовать результат в CAD‑сборках (через mesh‑представление и внешнюю конвертацию).
+- переиспользовать результат в CAD-сборках (через представление на основе сетки и внешнюю конвертацию).
 
 ---
 
@@ -104,16 +102,21 @@ slice2solid позволяет:
 
 Установка (из корня репозитория):
 - `python -m venv .venv`
-- `.\.venv\Scripts\Activate.ps1`
+- `.\.venv\Scripts\Activate.ps1` (PowerShell)
 - `pip install -r requirements.txt`
 
 Запуск GUI (основной режим):
 - `python run_gui.py`
+  - или проще: `.\run_gui.cmd` / `.\run_gui.ps1` (запускают venv Python без Activate.ps1)
+
+Если PowerShell блокирует активацию virtualenv (ExecutionPolicy), можно:
+- один раз включить запуск локальных скриптов: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+- или запускать без активации: `.\.venv\Scripts\python.exe run_gui.py`
 
 Если процесс GUI стартует, но окно не видно (например, после отключения второго монитора):
 - `python run_gui.py --reset-ui`
 
-CLI‑утилита (на данный момент — standalone Mesh Healer):
+CLI-утилита (на данный момент - standalone Mesh Healer):
 - `python run_cli.py heal data/samples/smoke_preview_structure.stl --heal-preset safe --close-holes-max 2.0 --report heal_report.json`
 
 ---
@@ -127,8 +130,8 @@ CLI‑утилита (на данный момент — standalone Mesh Healer)
 5. Выполнить slicing
 6. Экспортировать симуляцию траекторий: `*-simulation-data.txt`
 7. Запустить `slice2solid` для получения:
-   - CAE‑ориентированного представления и ориентаций траекторий
-   - (опционально) mesh‑геометрии внутренней структуры
+   - CAE-ориентированного представления и ориентаций траекторий
+   - (опционально) геометрии внутренней структуры в виде сетки (mesh)
 8. Выполнить расчёт в ANSYS
 
 ---
@@ -137,9 +140,9 @@ CLI‑утилита (на данный момент — standalone Mesh Healer)
 
 Минимально необходимо:
 - текстовый экспорт симуляции траекторий из Insight: `*-simulation-data.txt` (с блоком заголовка `Toolpath Simulation Data`, матрицей `STL to CMB transformation matrix` и таблицей траекторий);
-- `placed STL` из Insight (эталонная геометрия для габаритов/сопоставления координат и предпросмотра/экспорта).
+- копия исходной геометрии `*.stl` в папке задания `ssys_*` (в Insight включите сохранение STL в папку задания / Save STL copy in job folder).
 
-Опционально (рекомендуется для авто‑параметров/метаданных):
+Опционально (рекомендуется для авто-параметров/метаданных):
 - папка задания Insight `ssys_*` с `sliceParams.*`, `toolpathParams.*`, `supportParams.*` и др.
 
 Примечания:
@@ -151,12 +154,23 @@ CLI‑утилита (на данный момент — standalone Mesh Healer)
 ## Выходные данные (Outputs)
 
 Основные выходные файлы (в выбранной папке результата):
-- `*_s2s_preview_structure.stl` — mesh‑результат пайплайна (предпросмотр/экспорт структуры);
-- `*_s2s_preview_structure_healed.stl` — (опционально) «вылеченная» сетка для импорта в CAD как mesh;
-- `*_s2s_preview_structure_healed_report.json` — (опционально) отчёт до/после по сетке;
-- `*_s2s_preview_structure_mesh.ply`, `voxel_points.csv`, `cad_import_notes.txt` — (опционально) CAD bundle для внешних инструментов;
-- `ansys_layers.json`, `ansys_layers.csv`, `ansys_mechanical_import_layers.py` — (опционально) экспорт для ANSYS Mechanical;
-- `metadata.json` — метаданные запуска (параметры, матрицы, оценки размеров/сеток и т.п.).
+В корне:
+- `metadata.json` — метаданные запуска (параметры, матрица STL -> CMB, статистика).
+
+`CAD/` (явная геометрия инфилла + файлы для CAD и инструментов работы с сеткой):
+- `CAD/*_s2s_preview_structure.stl` — сетка (mesh), результат обработки (обычно очень большой файл);
+- `CAD/*_s2s_preview_structure_healed.stl` — (опционально) исправленная сетка для импорта в CAD как сетку (mesh);
+- `CAD/*_s2s_preview_structure_healed_report.json` — (опционально) отчёт до/после по сетке;
+- `CAD/*_s2s_preview_structure_mesh.ply`, `CAD/voxel_points.csv`, `CAD/cad_import_notes.txt` — (опционально) пакет для CAD (CAD bundle).
+
+`CAE/` (слои/ориентации + скрипты для ANSYS Mechanical):
+- `CAE/ansys_layers.json`, `CAE/ansys_layers.csv` - карта слоёв/ориентаций;
+- `CAE/ansys_mechanical_import_layers.py` - основной скрипт импорта слоёв в Mechanical;
+- `CAE/ansys_mechanical_section_planes.py` - вспомогательный скрипт: Section Plane по Z (и опциональный экспорт PNG по слоям);
+- `CAE/cae_import_notes.txt` - краткая инструкция по использованию файлов CAE (в т.ч. скриптов Mechanical).
+
+`DIAG/`:
+- диагностические файлы слайсера (например, распакованный `.sgm`), если доступно.
 
 ---
 
@@ -177,17 +191,17 @@ slice2solid/
 
 ---
 
-## Mesh Healer (CAD‑импорт сеток)
+## Mesh Healer (CAD: импорт сеток)
 
 slice2solid умеет выполнять «лечение» сетки после экспорта STL, создавая `*_healed.stl`.
-Цель — повысить вероятность успешного импорта в CAD‑системы, которые поддерживают mesh‑тела (по возможности делая сетку более «watertight/manifold»),
+Цель — повысить вероятность успешного импорта в CAD-системы, которые поддерживают сеточные тела (mesh bodies), по возможности делая сетку более корректной (watertight/manifold),
 избегая ремешинга/упрощения, способного разрушить детали инфилла.
 
 ### GUI (рекомендуется)
 
 - Вкладка `CAD / Геометрия` → блок `Mesh Healer (CAD)`
 - Профиль: `safe` (по умолчанию) или `aggressive`
-- Опционально можно включить JSON‑отчёт со статистикой до/после рядом с выходным STL
+- Опционально можно включить JSON-отчёт со статистикой до/после рядом с выходным STL
 
 Выходные файлы в папке результата:
 - `*_s2s_preview_structure.stl` (исходный)
@@ -207,7 +221,7 @@ slice2solid умеет выполнять «лечение» сетки посл
 
 ## Документация
 
-- `TECHNICAL_SPECIFICATION_RU.md` — полное описание пайплайна, входов/выходов, преобразований координат и ограничений
+- `TECHNICAL_SPECIFICATION_RU.md` — полное описание процесса обработки, входов/выходов, преобразований координат и ограничений
 - `TECHNICAL_SPECIFICATION.md` — версия на английском
 - `docs/cad_import_guide_ru.md` — заметки по импорту mesh в CAD
 - `docs/installer_ru.md` — сборка установщика для Windows
@@ -225,7 +239,7 @@ slice2solid умеет выполнять «лечение» сетки посл
 ## Дальнейшая работа (Future Work)
 
 - поддержка дополнительных слайсеров;
-- экспорт в CAE‑готовые форматы и улучшение связки с Mechanical;
+- экспорт в CAE-готовые форматы и улучшение связки с Mechanical;
 - автоматизированное построение карт анизотропии для FEM;
 - межслойные когезионные модели и прогрессирующее разрушение;
 - учёт остаточных напряжений и многоматериальной печати.
@@ -235,3 +249,26 @@ slice2solid умеет выполнять «лечение» сетки посл
 ## Проверка (smoke)
 
 - `python -m unittest discover -s tests -p "test_*.py"`
+
+---
+
+## CMB Pipeline + ANSYS (Updated)
+
+slice2solid работает в координатах **CMB (Insight build space)**:
+- Ось печати всегда **Z+** (как в Insight/слайсере).
+- Матрица **STL -> CMB** из `*-simulation-data.txt` учитывает ориентацию и компенсацию усадки (shrink factors).
+
+### Что выбирать в GUI
+- Выберите папку задания Insight `ssys_*` (внутри `*-simulation-data.txt` и, для CAD-режима, копия `*.stl`).
+- Нажмите Запуск (выход по умолчанию: `ssys_*/slice2solid_out`).
+
+### Что импортировать в ANSYS (для CAE расчёта)
+- Импортируйте **внешнюю** геометрию детали (исходный CAD-solid или обычный STL детали в номинале).
+- Сгенерируйте mesh в Mechanical.
+- Запустите `CAE/ansys_mechanical_import_layers.py` из папки результата.
+  - По умолчанию `APPLY_STL_TO_CMB = True`, поэтому деталь не нужно вручную поворачивать/масштабировать под CMB.
+  - Если вы уже импортировали геометрию в CMB — установите `APPLY_STL_TO_CMB = False`.
+- Для визуальной проверки слоёв: `CAE/ansys_mechanical_section_planes.py` (меняйте `Z_MM`).
+
+### Когда импортировать явный инфилл в ANSYS
+- Только если действительно хотите считать "реальную" структуру: `CAD/*_s2s_preview_structure.stl` (файл обычно очень тяжёлый для построения сетки и для Mechanical).

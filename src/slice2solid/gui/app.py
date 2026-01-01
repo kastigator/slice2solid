@@ -4,6 +4,7 @@ import html
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -43,10 +44,44 @@ def _lazy_import_pyvista() -> bool:
         QtInteractor = None
         return False
 
+
+def _preferred_preview_backend() -> str:
+    """
+    Returns one of: "auto", "vtk", "gl", "2d".
+
+    Environment override:
+      S2S_PREVIEW_BACKEND=auto|vtk|gl|2d
+    """
+    try:
+        v = str(os.environ.get("S2S_PREVIEW_BACKEND", "")).strip().lower()
+    except Exception:
+        v = ""
+    if v in ("auto", "vtk", "gl", "2d"):
+        return v
+    return "auto"
+
+
+def _select_view_cls() -> type[QtWidgets.QWidget]:
+    backend = _preferred_preview_backend()
+    if backend == "vtk":
+        if _lazy_import_pyvista():
+            return _MeshVTKView
+        return _Mesh3DView if gl is not None else _Mesh2DView
+    if backend == "gl":
+        return _Mesh3DView if gl is not None else (_MeshVTKView if _lazy_import_pyvista() else _Mesh2DView)
+    if backend == "2d":
+        return _Mesh2DView
+    # auto: prefer VTK, but will fall back at runtime if init fails.
+    if _lazy_import_pyvista():
+        return _MeshVTKView
+    if gl is not None:
+        return _Mesh3DView
+    return _Mesh2DView
+
+
 from slice2solid.core.insight_simulation import (
-    invert_rowvec_matrix,
     read_simulation_export,
-    transform_toolpath_points_rowvec,
+    transform_points_rowvec,
 )
 from slice2solid.core.insight_params import (
     estimate_auto_max_jump_mm,
@@ -61,6 +96,185 @@ from slice2solid.core.cad_bundle import export_voxel_centers_csv
 from slice2solid.core.voxelize import mesh_from_voxels_configured, voxelize_toolpath
 from slice2solid.app_info import APP_DISPLAY_NAME, AUTHOR, CONTACT_EMAIL, DEPARTMENT, ORGANIZATION, VERSION
 from slice2solid.mesh_heal import heal_mesh_file
+
+
+def infer_simulation_txt_from_job(job_dir: str | Path) -> Path | None:
+    root = Path(job_dir)
+    if not root.exists():
+        return None
+
+    pats = (
+        "*-simulation-data.txt",
+        "*simulation-data*.txt",
+        "*simulation*data*.txt",
+        "*simulation*.txt",
+    )
+    seen: set[Path] = set()
+    candidates: list[Path] = []
+    for pat in pats:
+        for p in root.glob(pat):
+            if p.is_file() and p not in seen:
+                seen.add(p)
+                candidates.append(p)
+
+    if not candidates:
+        return None
+
+    # Prefer the most explicit conventional name.
+    candidates.sort(key=lambda p: (("simulation-data" not in p.name.lower()), len(p.name), p.name.lower()))
+    return candidates[0]
+
+
+def infer_stl_from_job_folder(job_dir: str | Path) -> Path | None:
+    root = Path(job_dir)
+    if not root.exists():
+        return None
+    stls = [p for p in root.glob("*.stl") if p.is_file()]
+    stls += [p for p in root.glob("*.STL") if p.is_file()]
+    stls = list({p.resolve() for p in stls})
+    if len(stls) == 1:
+        return stls[0]
+    return infer_stl_path_from_job(root)
+
+
+def extract_toolpath_segments_for_layer(
+    simulation_txt: str | Path,
+    *,
+    z_center_mm: float,
+    slice_height_mm: float,
+    max_jump_mm: float | None,
+    max_segments: int = 250_000,
+) -> np.ndarray:
+    """
+    Builds line segments approximating the toolpath at a given Z layer.
+
+    This is meant for a slicer-like preview (Cura-style) and is intentionally lightweight:
+    - only Type=1
+    - filters to a thin slab around z_center_mm
+    - breaks segments on large jumps
+    """
+    tol = max(1e-6, 0.45 * float(slice_height_mm))
+    max_jump = float(max_jump_mm) if (max_jump_mm is not None and float(max_jump_mm) > 0) else None
+
+    _hdr, rows = read_simulation_export(simulation_txt)
+    last: tuple[float, float, float] | None = None
+    seg: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+
+    for pt in rows:
+        if pt.type != 1:
+            last = None
+            continue
+        try:
+            if float(pt.factor) <= 0 or float(pt.bead_area) <= 0:
+                last = None
+                continue
+        except Exception:
+            pass
+        z = float(pt.z)
+        if abs(z - float(z_center_mm)) > tol:
+            last = None
+            continue
+        cur = (float(pt.x), float(pt.y), z)
+        if last is not None:
+            dx = cur[0] - last[0]
+            dy = cur[1] - last[1]
+            dz = cur[2] - last[2]
+            d = float((dx * dx + dy * dy + dz * dz) ** 0.5)
+            if max_jump is None or d <= max_jump:
+                seg.append((last, cur))
+                if len(seg) >= int(max_segments):
+                    break
+            else:
+                last = cur
+                continue
+        last = cur
+
+    if not seg:
+        return np.zeros((0, 2, 3), dtype=np.float32)
+    arr = np.asarray(seg, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[1:] != (2, 3):
+        return np.zeros((0, 2, 3), dtype=np.float32)
+    return arr
+
+
+def extract_toolpath_segments_for_range(
+    simulation_txt: str | Path,
+    *,
+    z0_mm: float,
+    slice_height_mm: float,
+    max_layer_id_inclusive: int | None,
+    max_jump_mm: float | None,
+    max_segments: int = 600_000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (range_segments, current_layer_segments).
+
+    - range_segments: segments from layer 0..max_layer_id_inclusive (or all if None)
+    - current_layer_segments: segments only at max_layer_id_inclusive (or empty if None)
+    """
+    if slice_height_mm <= 0:
+        return (np.zeros((0, 2, 3), dtype=np.float32), np.zeros((0, 2, 3), dtype=np.float32))
+
+    max_jump = float(max_jump_mm) if (max_jump_mm is not None and float(max_jump_mm) > 0) else None
+    max_lid = int(max_layer_id_inclusive) if max_layer_id_inclusive is not None else None
+
+    _hdr, rows = read_simulation_export(simulation_txt)
+
+    last_pt: tuple[float, float, float] | None = None
+    last_lid: int | None = None
+
+    seg_range: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+    seg_cur: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+
+    for pt in rows:
+        if pt.type != 1:
+            last_pt = None
+            last_lid = None
+            continue
+        try:
+            if float(pt.factor) <= 0 or float(pt.bead_area) <= 0:
+                last_pt = None
+                last_lid = None
+                continue
+        except Exception:
+            pass
+
+        z = float(pt.z)
+        lid = int(round((z - float(z0_mm)) / float(slice_height_mm)))
+        if lid < 0:
+            last_pt = None
+            last_lid = None
+            continue
+        if max_lid is not None and lid > max_lid:
+            last_pt = None
+            last_lid = None
+            continue
+
+        cur = (float(pt.x), float(pt.y), z)
+        if last_pt is not None and last_lid == lid:
+            dx = cur[0] - last_pt[0]
+            dy = cur[1] - last_pt[1]
+            dz = cur[2] - last_pt[2]
+            d = float((dx * dx + dy * dy + dz * dz) ** 0.5)
+            if max_jump is None or d <= max_jump:
+                seg_range.append((last_pt, cur))
+                if max_lid is not None and lid == max_lid:
+                    seg_cur.append((last_pt, cur))
+        last_pt = cur
+        last_lid = lid
+
+        if len(seg_range) >= int(max_segments):
+            break
+
+    def _to_arr(seg: list[tuple[tuple[float, float, float], tuple[float, float, float]]]) -> np.ndarray:
+        if not seg:
+            return np.zeros((0, 2, 3), dtype=np.float32)
+        arr = np.asarray(seg, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[1:] != (2, 3):
+            return np.zeros((0, 2, 3), dtype=np.float32)
+        return arr
+
+    return (_to_arr(seg_range), _to_arr(seg_cur))
 
 
 @dataclass
@@ -106,16 +320,43 @@ class Worker(QtCore.QObject):
     def run(self) -> None:
         try:
             t0 = time.time()
+            scratch_run: Path | None = None
+            scratch_note_logged = False
+
+            def _scratch_size_bytes(p: Path) -> int:
+                total = 0
+                try:
+                    if not p.exists():
+                        return 0
+                    for e in os.scandir(p):
+                        try:
+                            if e.is_file():
+                                total += int(e.stat().st_size)
+                        except Exception:
+                            pass
+                except Exception:
+                    return 0
+                return int(total)
+
+            def _fmt_gb(n: int) -> str:
+                try:
+                    return f"{float(n) / float(1024**3):.2f} GB"
+                except Exception:
+                    return f"{n} bytes"
+
             sim_header, rows_iter = read_simulation_export(self.cfg.simulation_txt)
             for w in sim_header.validation_warnings():
-                self.log.emit(f"WARNING: {w}")
+                self.log.emit(f"ПРЕДУПРЕЖДЕНИЕ: {w}")
             slice_h = sim_header.slice_height_mm or 0.254
+
+            # Single supported mode: CMB (Insight build coordinates).
+            coord_space = "cmb"
 
             if not self.cfg.export_cae_layers and not self.cfg.export_geometry_preview:
                 raise ValueError("Не выбраны выходные файлы: включите Геометрию и/или экспорт для ANSYS.")
 
             if self.cfg.export_geometry_preview:
-                self.log.emit("Загрузка placed STL…")
+                self.log.emit("Загрузка STL...")
                 mesh = trimesh.load_mesh(self.cfg.placed_stl, force="mesh")
                 bounds_min = mesh.bounds[0]
                 bounds_max = mesh.bounds[1]
@@ -125,7 +366,7 @@ class Worker(QtCore.QObject):
                 try:
                     p_stl = Path(self.cfg.placed_stl) if self.cfg.placed_stl else None
                     if p_stl is not None and p_stl.exists():
-                        self.log.emit("Загрузка placed STL (только bbox):")
+                        self.log.emit("Загрузка STL (только bbox):")
                         _m = trimesh.load_mesh(str(p_stl), force="mesh")
                         bounds_min = _m.bounds[0]
                         bounds_max = _m.bounds[1]
@@ -133,9 +374,37 @@ class Worker(QtCore.QObject):
                     bounds_min = None
                     bounds_max = None
 
-            self.log.emit("Подготовка преобразования координат (CMB → placed STL)…")
+            self.log.emit("Подготовка преобразования координат (STL -> CMB)...")
             stl_to_cmb = sim_header.stl_to_cmb
-            cmb_to_stl = invert_rowvec_matrix(stl_to_cmb)
+            # CMB-only pipeline: toolpath table is already in CMB coordinates.
+
+            # Full pipeline in Insight build coordinates. Toolpath table is already in CMB.
+            layer_axis_xyz = (0.0, 0.0, 1.0)
+            self.log.emit("Координаты: CMB (Insight). Ось печати: Z+")
+
+            # Transform STL bounds to CMB so voxelization bounds are in the same space as toolpath.
+            try:
+                if bounds_min is not None and bounds_max is not None:
+                    bmin = np.asarray(bounds_min, dtype=float)
+                    bmax = np.asarray(bounds_max, dtype=float)
+                    corners = np.array(
+                        [
+                            [bmin[0], bmin[1], bmin[2]],
+                            [bmin[0], bmin[1], bmax[2]],
+                            [bmin[0], bmax[1], bmin[2]],
+                            [bmin[0], bmax[1], bmax[2]],
+                            [bmax[0], bmin[1], bmin[2]],
+                            [bmax[0], bmin[1], bmax[2]],
+                            [bmax[0], bmax[1], bmin[2]],
+                            [bmax[0], bmax[1], bmax[2]],
+                        ],
+                        dtype=float,
+                    )
+                    corners_cmb = transform_points_rowvec(corners, np.asarray(stl_to_cmb, dtype=float))
+                    bounds_min = corners_cmb.min(axis=0)
+                    bounds_max = corners_cmb.max(axis=0)
+            except Exception:
+                pass
 
             total = 0
             kept = 0
@@ -187,33 +456,37 @@ class Worker(QtCore.QObject):
                     return
 
                 msg = (
-                    "Toolpath bbox (CMB→STL) does not match placed STL bounds "
-                    f"(max exceed {max_exceed:.3f} mm, tol {tol:.3f} mm). "
-                    "Likely wrong transform / units / shrink."
+                    "Габариты траекторий (CMB->STL) не совпадают с габаритами STL "
+                    f"(макс. расхождение {max_exceed:.3f} мм, допуск {tol:.3f} мм). "
+                    "Возможна неверная матрица, единицы или усадка."
                 )
                 if max_exceed >= err:
                     raise ValueError(msg)
-                self.log.emit(f"WARNING: {msg}")
+                self.log.emit(f"ПРЕДУПРЕЖДЕНИЕ: {msg}")
 
             layers = []
             z0 = None
 
             if self.cfg.export_cae_layers:
-                if bounds_min is not None:
+                if bounds_min is not None and bounds_max is not None:
+                    # CMB-only: build axis is always Z+.
                     z0 = float(bounds_min[2])
                 else:
-                    self.log.emit("Сканирование Z0 (min Z) для CAE…")
+                    self.log.emit("Сканирование Z0 (min Z) для CAE...")
                     z0_val = None
-                    for pt in _count_points(_track_bbox(transform_toolpath_points_rowvec(rows_iter, cmb_to_stl))):
+                    for pt in _count_points(_track_bbox(rows_iter)):
                         if pt.type != 1:
                             continue
-                        z0_val = float(pt.z) if z0_val is None else min(z0_val, float(pt.z))
+                        coord = float(
+                            layer_axis_xyz[0] * float(pt.x) + layer_axis_xyz[1] * float(pt.y) + layer_axis_xyz[2] * float(pt.z)
+                        )
+                        z0_val = coord if z0_val is None else min(z0_val, coord)
                     counted = True
                     z0 = float(z0_val) if z0_val is not None else 0.0
                     sim_header, rows_iter = read_simulation_export(self.cfg.simulation_txt)
 
-                self.log.emit("Computing per-layer print orientation (CAE export)…")
-                pts = _track_bbox(transform_toolpath_points_rowvec(rows_iter, cmb_to_stl))
+                self.log.emit("Расчёт ориентации печати по слоям (CAE)...")
+                pts = _track_bbox(rows_iter)
                 if bounds_min is None and not counted:
                     pts = _count_points(pts)
                     counted = True
@@ -221,6 +494,7 @@ class Worker(QtCore.QObject):
                     pts,
                     slice_height_mm=float(slice_h),
                     z0_mm=float(z0),
+                    layer_axis_xyz=layer_axis_xyz,
                     max_jump_mm=self.cfg.max_jump_mm,
                     weight_by_bead_area=True,
                 )
@@ -235,11 +509,72 @@ class Worker(QtCore.QObject):
                 bmin = bounds_min - pad
                 bmax = bounds_max + pad
 
-                self.log.emit("Вокселизация…")
+                self.log.emit("Построение объёма (вокселизация)...")
                 self.progress.emit(35)
                 _header2, rows2 = read_simulation_export(self.cfg.simulation_txt)
-                pts_iter = _track_bbox(_count_points(transform_toolpath_points_rowvec(rows2, cmb_to_stl)))
+                pts_iter = _track_bbox(_count_points(rows2))
                 counted = True
+
+                scratch = None
+                try:
+                    base = os.environ.get("S2S_SCRATCH_DIR", "").strip()
+                    scratch_base = Path(base) if base else (diag_dir / "scratch")
+                    stamp = time.strftime("%Y%m%d_%H%M%S")
+                    scratch_run = scratch_base / f"run_{stamp}_{os.getpid()}"
+                    scratch_run.mkdir(parents=True, exist_ok=True)
+                    scratch = scratch_run
+                except Exception:
+                    scratch = None
+                if scratch is not None and not scratch_note_logged:
+                    scratch_note_logged = True
+                    keep = os.environ.get("S2S_KEEP_SCRATCH") == "1"
+                    thr = os.environ.get("S2S_MEMMAP_THRESHOLD_MB", "256")
+                    self.log.emit(f"Временная папка (scratch): {scratch}")
+                    self.log.emit(f"Порог перехода на диск: {thr} MB (S2S_MEMMAP_THRESHOLD_MB)")
+                    if keep:
+                        self.log.emit("Временные файлы: НЕ удалять (S2S_KEEP_SCRATCH=1)")
+                    else:
+                        self.log.emit("Временные файлы: автоудаление после прогона (S2S_KEEP_SCRATCH=1 - не удалять)")
+
+                # Preflight disk check: quality-first out-of-core uses scratch heavily.
+                try:
+                    if scratch is not None:
+                        try:
+                            thr_mb = int(os.environ.get("S2S_MEMMAP_THRESHOLD_MB", "256"))
+                            thr_mb = max(0, thr_mb)
+                        except Exception:
+                            thr_mb = 256
+                        threshold = int(thr_mb) * 1024 * 1024
+
+                        size = (bmax - bmin).astype(float)
+                        shape = tuple(int(math.ceil(float(s) / float(self.cfg.voxel_size_mm))) + 1 for s in size)
+                        voxels = int(np.prod(shape, dtype=np.int64))
+                        occ_bytes = int(voxels)  # bool memmap: ~1 byte / voxel
+                        need = 0
+                        if occ_bytes >= threshold:
+                            need += occ_bytes
+                        if float(self.cfg.volume_smooth_sigma_vox or 0.0) > 0:
+                            vol_bytes = int(voxels) * 4  # float32
+                            if vol_bytes >= threshold:
+                                # Conservative: vol + blur + transpose
+                                need += 3 * vol_bytes
+
+                        if need > 0:
+                            free = int(shutil.disk_usage(str(scratch)).free)
+                            if need > int(free * 0.80):
+                                need_gb = need / (1024**3)
+                                free_gb = free / (1024**3)
+                                raise RuntimeError(
+                                    "Недостаточно места на диске для временных файлов.\n"
+                                    f"Оценка: нужно ~{need_gb:.1f} GB, доступно ~{free_gb:.1f} GB.\n\n"
+                                    "Решение (без потери качества геометрии):\n"
+                                    " - Укажите папку на диске с большим свободным местом через `S2S_SCRATCH_DIR`.\n"
+                                    " - Освободите место на диске.\n\n"
+                                    "Если согласны на компромисс качества: увеличьте Voxel size или Downsample."
+                                )
+                except Exception:
+                    # Fail early with clear message.
+                    raise
                 vox = voxelize_toolpath(
                     pts_iter,
                     voxel_size=self.cfg.voxel_size_mm,
@@ -250,11 +585,12 @@ class Worker(QtCore.QObject):
                     max_radius_mm=self.cfg.max_radius_mm,
                     max_jump_mm=self.cfg.max_jump_mm,
                     min_component_voxels=self.cfg.min_component_voxels,
+                    scratch_dir=scratch,
                 )
                 _check_bbox_against_stl()
                 self.progress.emit(70)
 
-                self.log.emit("Построение сетки (marching cubes)…")
+                self.log.emit("Построение поверхности (marching cubes)...")
                 preview_mesh = mesh_from_voxels_configured(
                     vox,
                     volume_smooth_sigma_vox=self.cfg.volume_smooth_sigma_vox,
@@ -262,17 +598,18 @@ class Worker(QtCore.QObject):
                     downsample_factor=int(self.cfg.meshing_downsample_factor)
                     if int(self.cfg.meshing_downsample_factor) > 1
                     else None,
+                    scratch_dir=scratch,
                 )
                 try:
                     ds = int(preview_mesh.metadata.get("meshing_downsample_factor", 1))
                     eff = float(preview_mesh.metadata.get("meshing_voxel_size_mm", float(self.cfg.voxel_size_mm)))
                     if ds > 1:
-                        self.log.emit(f"Meshing downsample: x{ds} (effective voxel {eff:.3f} mm)")
+                        self.log.emit(f"Разрежение при построении поверхности: x{ds} (эффективный шаг {eff:.3f} мм)")
                 except Exception:
                     pass
                 mesh_before = preview_mesh.copy()
                 if self.cfg.smooth_iterations > 0:
-                    self.log.emit(f"Сглаживание сетки ({self.cfg.smooth_iterations} итераций)…")
+                    self.log.emit(f"Сглаживание сетки ({self.cfg.smooth_iterations} итераций)...")
                     trimesh.smoothing.filter_laplacian(preview_mesh, iterations=int(self.cfg.smooth_iterations))
                 mesh_after = preview_mesh
                 try:
@@ -323,38 +660,55 @@ class Worker(QtCore.QObject):
 
             out_dir = Path(self.cfg.output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
-            # Prefix geometry outputs to reduce confusion with the user-provided "placed STL".
+            # Logical output structure:
+            #   out/
+            #     CAD/  (explicit infill geometry + CAD bundle)
+            #     CAE/  (layer orientation tables + ANSYS Mechanical scripts)
+            #     DIAG/ (optional slicer diagnostics)
+            cad_dir = out_dir / "CAD"
+            cae_dir = out_dir / "CAE"
+            diag_dir = out_dir / "DIAG"
+            cad_dir.mkdir(parents=True, exist_ok=True)
+            cae_dir.mkdir(parents=True, exist_ok=True)
+            diag_dir.mkdir(parents=True, exist_ok=True)
+
+            # Prefix geometry outputs to reduce confusion with the user-provided STL.
             preview_stem = _preview_mesh_stem(self.cfg)
-            out_stl = out_dir / f"{preview_stem}.stl"
+            out_stl = cad_dir / f"{preview_stem}.stl"
             # PLY is an optional CAD-bundle artifact; name it explicitly to avoid confusion with the STL.
-            out_ply = out_dir / f"{preview_stem}_mesh.ply"
-            out_ply_before = out_dir / f"{preview_stem}_mesh_before.ply"
-            out_notes = out_dir / "cad_import_notes.txt"
-            out_points = out_dir / "voxel_points.csv"
+            out_ply = cad_dir / f"{preview_stem}_mesh.ply"
+            out_notes = cad_dir / "cad_import_notes.txt"
+            out_points = cad_dir / "voxel_points.csv"
             out_json = out_dir / "metadata.json"
-            out_layers_json = out_dir / "ansys_layers.json"
-            out_layers_csv = out_dir / "ansys_layers.csv"
-            out_ansys_script = out_dir / "ansys_mechanical_import_layers.py"
-            out_mapdl_script = out_dir / "ansys_mapdl_layers.mac"
-            out_section_planes_script = out_dir / "ansys_mechanical_section_planes.py"
-            out_insight_sgm = out_dir / "insight_part.sgm"
+            out_layers_json = cae_dir / "ansys_layers.json"
+            out_layers_csv = cae_dir / "ansys_layers.csv"
+            out_ansys_script = cae_dir / "ansys_mechanical_import_layers.py"
+            out_section_planes_script = cae_dir / "ansys_mechanical_section_planes.py"
+            out_cae_notes = cae_dir / "cae_import_notes.txt"
 
             outputs: list[str] = []
             bundle_written = False
 
+            # In CMB mode, export the input STL transformed into CMB coordinates for easy CAE import/validation.
+            try:
+                # Intentionally not exported: we keep a single geometry output (`*_s2s_preview_structure.stl`) to avoid confusion.
+                pass
+            except Exception:
+                pass
+
             if self.cfg.export_geometry_preview and preview_mesh is not None:
-                self.log.emit(f"Запись {out_stl}…")
+                self.log.emit(f"Запись {out_stl}...")
                 preview_mesh.export(out_stl)
                 outputs.append(str(out_stl))
                 if bool(self.cfg.heal_enabled):
                     try:
-                        healed_stl = out_dir / f"{out_stl.stem}_healed{out_stl.suffix}"
+                        healed_stl = cad_dir / f"{out_stl.stem}_healed{out_stl.suffix}"
                         report_path = None
                         if bool(self.cfg.heal_report_enabled):
                             if self.cfg.heal_report_path:
                                 report_path = Path(self.cfg.heal_report_path)
                             else:
-                                report_path = out_dir / f"{out_stl.stem}_healed_report.json"
+                                report_path = cad_dir / f"{out_stl.stem}_healed_report.json"
                         self.log.emit(
                             f"Mesh Healer: preset={self.cfg.heal_preset}, close_holes_max={self.cfg.heal_close_holes_max_mm} мм"
                         )
@@ -370,17 +724,10 @@ class Worker(QtCore.QObject):
                         if report_path is not None:
                             outputs.append(str(report_path))
                     except Exception as e:
-                        self.log.emit(f"WARNING: Mesh Healer failed: {e}")
-                try:
-                    if mesh_before is not None:
-                        self.log.emit(f"Запись {out_ply_before}:")
-                        mesh_before.export(out_ply_before)
-                        outputs.append(str(out_ply_before))
-                except Exception:
-                    pass
+                        self.log.emit(f"ПРЕДУПРЕЖДЕНИЕ: исправление сетки (Mesh Healer) не удалось: {e}")
                 if self.cfg.export_cad_bundle:
                     try:
-                        self.log.emit(f"Запись {out_ply}…")
+                        self.log.emit(f"Запись {out_ply}...")
                         preview_mesh.export(out_ply)
                         outputs.append(str(out_ply))
 
@@ -389,7 +736,7 @@ class Worker(QtCore.QObject):
                         outputs.append(str(out_notes))
 
                         if vox is not None:
-                            self.log.emit(f"Запись {out_points}…")
+                            self.log.emit(f"Запись {out_points}...")
                             res = export_voxel_centers_csv(
                                 vox.occupied,
                                 origin_xyz_mm=vox.origin,
@@ -403,15 +750,18 @@ class Worker(QtCore.QObject):
                             outputs.append(str(out_points))
                         bundle_written = True
                     except Exception as e:
-                        self.log.emit(f"CAD bundle пропущен: {e}")
+                        self.log.emit(f"ПРЕДУПРЕЖДЕНИЕ: пакет для CAD пропущен: {e}")
 
             if self.cfg.export_cae_layers:
-                self.log.emit(f"Запись {out_layers_json}…")
+                self.log.emit(f"Запись {out_layers_json}...")
                 out_layers_json.write_text(
                     json.dumps(
                         {
                             "slice_height_mm": float(slice_h),
                             "z0_mm": float(z0) if z0 is not None else None,
+                            "build_axis": "z",
+                            "build_axis_sign": 1,
+                            "layer_axis_xyz": [0.0, 0.0, 1.0],
                             "layers": [
                                 {
                                     "layer_id": l.layer_id,
@@ -433,7 +783,7 @@ class Worker(QtCore.QObject):
                     encoding="utf-8",
                 )
                 outputs.append(str(out_layers_json))
-                self.log.emit(f"Запись {out_layers_csv}…")
+                self.log.emit(f"Запись {out_layers_csv}...")
                 lines = ["layer_id,z_min_mm,z_max_mm,angle_deg,dx,dy,dz,confidence,segments_used,total_weight"]
                 for l in layers:
                     if l.dir_xyz is None:
@@ -448,55 +798,41 @@ class Worker(QtCore.QObject):
                 out_layers_csv.write_text("\n".join(lines), encoding="utf-8")
                 outputs.append(str(out_layers_csv))
 
-                self.log.emit(f"Запись {out_ansys_script}…")
-                out_ansys_script.write_text(_render_ansys_mechanical_script(self.cfg), encoding="utf-8")
-                outputs.append(str(out_ansys_script))
-
-                # Preferred (path B): MAPDL snippet for layer components + ESYS assignment.
-                out_mapdl_script.write_text(
-                    _render_ansys_mapdl_script(
-                        layers=[
-                            {
-                                "layer_id": l.layer_id,
-                                "z_min": l.z_min,
-                                "z_max": l.z_max,
-                                "z_center": l.z_center,
-                                "dir_xyz": list(l.dir_xyz) if l.dir_xyz is not None else None,
-                                "angle_deg": l.angle_deg,
-                                "confidence": l.confidence,
-                                "segments_used": l.segments_used,
-                                "total_weight": l.total_weight,
-                            }
-                            for l in layers
-                        ],
-                        cfg=self.cfg,
-                    ),
+                self.log.emit(f"Запись {out_ansys_script}...")
+                out_ansys_script.write_text(
+                    # CAE default: import nominal CAD/STL (original coordinates) and apply STL->CMB inside the script.
+                    # User can set APPLY_STL_TO_CMB=False in the script if their model is already in CMB.
+                    _render_ansys_mechanical_script(self.cfg, stl_to_cmb=np.asarray(stl_to_cmb, dtype=float), apply_stl_to_cmb=True),
                     encoding="utf-8",
                 )
-                outputs.append(str(out_mapdl_script))
+                outputs.append(str(out_ansys_script))
 
                 # Mechanical helper: create a Section Plane (and optionally export PNGs per layer).
                 out_section_planes_script.write_text(
-                    _render_ansys_mechanical_section_planes_script(self.cfg),
+                    _render_ansys_mechanical_section_planes_script(
+                        self.cfg,
+                        stl_to_cmb=np.asarray(stl_to_cmb, dtype=float),
+                        apply_stl_to_cmb=True,
+                    ),
                     encoding="utf-8",
                 )
                 outputs.append(str(out_section_planes_script))
 
+                out_cae_notes.write_text(_render_cae_import_notes(self.cfg), encoding="utf-8")
+                outputs.append(str(out_cae_notes))
+
                 # Optional: extract Insight SGM (slice geometry) for diagnostics / validation.
                 try:
                     if self.cfg.job_dir and Path(self.cfg.job_dir).exists():
-                        extracted = extract_sgm_to_folder(self.cfg.job_dir, out_dir)
+                        extracted = extract_sgm_to_folder(self.cfg.job_dir, diag_dir)
                         if extracted is not None:
-                            try:
-                                out_insight_sgm.write_bytes(Path(extracted.extracted_path).read_bytes())
-                                outputs.append(str(out_insight_sgm))
-                            except Exception:
-                                outputs.append(str(extracted.extracted_path))
+                            outputs.append(str(extracted.extracted_path))
                 except Exception:
                     pass
 
             meta = {
                 "inputs": asdict(self.cfg),
+                "coordinate_space": "cmb",
                 "simulation_header": sim_header.raw,
                 "stl_to_cmb_matrix": sim_header.stl_to_cmb.tolist(),
                 "outputs": outputs,
@@ -531,6 +867,22 @@ class Worker(QtCore.QObject):
             out_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             outputs.append(str(out_json))
 
+            # Cleanup scratch by default: memmap files can be huge.
+            try:
+                if scratch_run is not None and os.environ.get("S2S_KEEP_SCRATCH") != "1":
+                    before = _scratch_size_bytes(scratch_run)
+                    shutil.rmtree(str(scratch_run), ignore_errors=False)
+                    self.log.emit(f"Временные файлы удалены: освобождено ~{_fmt_gb(before)}")
+            except Exception:
+                try:
+                    if scratch_run is not None and scratch_run.exists():
+                        sz = _scratch_size_bytes(scratch_run)
+                        self.log.emit(
+                            f"ПРЕДУПРЕЖДЕНИЕ: не удалось удалить временные файлы; осталось ~{_fmt_gb(sz)} в {scratch_run}"
+                        )
+                except Exception:
+                    self.log.emit("ПРЕДУПРЕЖДЕНИЕ: не удалось удалить временные файлы.")
+
             self.progress.emit(100)
             extra = ""
             if self.cfg.export_cae_layers:
@@ -542,6 +894,11 @@ class Worker(QtCore.QObject):
                 base = f"{out_json.name}{extra}"
             self.finished.emit(True, f"Готово. Файлы: {base}", outputs)
         except Exception as e:
+            try:
+                if scratch_run is not None and os.environ.get("S2S_KEEP_SCRATCH") != "1":
+                    shutil.rmtree(str(scratch_run), ignore_errors=True)
+            except Exception:
+                pass
             self.finished.emit(False, f"Ошибка: {e}", [])
 
 
@@ -585,6 +942,243 @@ def _load_logo_pixmap(size: int = 72) -> QtGui.QPixmap | None:
     return QtGui.QPixmap.fromImage(img)
 
 
+def _create_splash_pixmap(width: int = 640, height: int = 360) -> QtGui.QPixmap:
+    img = QtGui.QImage(width, height, QtGui.QImage.Format.Format_ARGB32)
+    img.fill(QtCore.Qt.GlobalColor.transparent)
+
+    p = QtGui.QPainter(img)
+    p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+
+    bg = QtGui.QLinearGradient(0.0, 0.0, float(width), float(height))
+    bg.setColorAt(0.0, QtGui.QColor("#061A2D"))
+    bg.setColorAt(0.55, QtGui.QColor("#0B2A4A"))
+    bg.setColorAt(1.0, QtGui.QColor("#0F3D66"))
+    p.fillRect(QtCore.QRectF(0.0, 0.0, float(width), float(height)), bg)
+
+    # Subtle "layers" motif.
+    layer_color = QtGui.QColor(255, 255, 255, 18)
+    p.setPen(QtGui.QPen(layer_color, 1.0))
+    for i in range(18):
+        y = int(height * 0.18 + i * (height * 0.035))
+        p.drawLine(int(width * 0.08), y, int(width * 0.92), y)
+
+    # Logo mark: S2S + stacked layers.
+    mark_r = int(min(width, height) * 0.16)
+    mark_cx = int(width * 0.18)
+    mark_cy = int(height * 0.42)
+    mark_rect = QtCore.QRect(mark_cx - mark_r, mark_cy - mark_r, 2 * mark_r, 2 * mark_r)
+
+    p.setPen(QtCore.Qt.PenStyle.NoPen)
+    p.setBrush(QtGui.QColor("#0E9AA7"))
+    p.drawEllipse(mark_rect)
+
+    p.setBrush(QtGui.QColor(255, 255, 255, 235))
+    inner = mark_rect.adjusted(int(mark_r * 0.14), int(mark_r * 0.14), -int(mark_r * 0.14), -int(mark_r * 0.14))
+    p.drawEllipse(inner)
+
+    p.setPen(QtGui.QPen(QtGui.QColor("#0B2A4A"), max(2, int(mark_r * 0.06))))
+    y0 = inner.center().y() - int(mark_r * 0.22)
+    for j in range(3):
+        yy = y0 + j * int(mark_r * 0.22)
+        p.drawLine(inner.left() + int(mark_r * 0.18), yy, inner.right() - int(mark_r * 0.18), yy)
+
+    font = QtGui.QFont()
+    font.setBold(True)
+    font.setPixelSize(int(mark_r * 0.44))
+    p.setFont(font)
+    p.setPen(QtGui.QPen(QtGui.QColor("#0B2A4A")))
+    p.drawText(inner, int(QtCore.Qt.AlignmentFlag.AlignCenter), "S2S")
+
+    # University crest (existing SVG icon) to keep the academic identity visible.
+    crest = _load_logo_pixmap(int(min(width, height) * 0.16))
+    if crest is not None and not crest.isNull():
+        crest_size = int(min(width, height) * 0.14)
+        crest = crest.scaled(
+            crest_size,
+            crest_size,
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        crest_x = int(width * 0.90) - crest.width()
+        crest_y = int(height * 0.12)
+        p.setOpacity(0.92)
+        p.drawPixmap(crest_x, crest_y, crest)
+        p.setOpacity(1.0)
+
+    # Title block.
+    title = "slice2solid"
+    subtitle = "Восстановление структуры"
+    version = f"v{VERSION}"
+
+    title_font = QtGui.QFont()
+    title_font.setBold(True)
+    title_font.setPixelSize(int(height * 0.11))
+    p.setFont(title_font)
+    p.setPen(QtGui.QColor("#FFFFFF"))
+    p.drawText(QtCore.QRectF(width * 0.30, height * 0.28, width * 0.66, height * 0.20), title)
+
+    sub_font = QtGui.QFont()
+    sub_font.setPixelSize(int(height * 0.055))
+    p.setFont(sub_font)
+    p.setPen(QtGui.QColor(235, 244, 255, 225))
+    p.drawText(QtCore.QRectF(width * 0.30, height * 0.47, width * 0.66, height * 0.12), subtitle)
+
+    ver_font = QtGui.QFont()
+    ver_font.setPixelSize(int(height * 0.045))
+    p.setFont(ver_font)
+    p.setPen(QtGui.QColor(255, 255, 255, 175))
+    p.drawText(QtCore.QRectF(width * 0.30, height * 0.58, width * 0.66, height * 0.10), version)
+
+    footer_font = QtGui.QFont()
+    footer_font.setPixelSize(int(height * 0.035))
+    p.setFont(footer_font)
+    p.setPen(QtGui.QColor(255, 255, 255, 150))
+    org = ORGANIZATION or ""
+    dept = DEPARTMENT or ""
+    author = AUTHOR or ""
+    footer = " • ".join([x for x in (org, dept, author) if x])
+    p.drawText(QtCore.QRectF(width * 0.08, height * 0.84, width * 0.84, height * 0.14), footer)
+
+    p.end()
+    return QtGui.QPixmap.fromImage(img)
+
+
+def _apply_app_style(app: QtWidgets.QApplication) -> None:
+    try:
+        app.setStyle("Fusion")
+    except Exception:
+        pass
+
+    try:
+        font = QtGui.QFont("Segoe UI", 10)
+        app.setFont(font)
+    except Exception:
+        pass
+
+    try:
+        pal = QtGui.QPalette()
+        pal.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#F6F7FB"))
+        pal.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#111827"))
+        pal.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#FFFFFF"))
+        pal.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#F3F4F6"))
+        pal.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor("#111827"))
+        pal.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor("#FFFFFF"))
+        pal.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#111827"))
+        pal.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor("#FFFFFF"))
+        pal.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#111827"))
+        pal.setColor(QtGui.QPalette.ColorRole.BrightText, QtGui.QColor("#EF4444"))
+        pal.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#2563EB"))
+        pal.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#FFFFFF"))
+        app.setPalette(pal)
+    except Exception:
+        pass
+
+    qss = """
+        QWidget { color: #111827; }
+
+        QGroupBox {
+            border: 1px solid #D7DBE5;
+            border-radius: 10px;
+            margin-top: 10px;
+            background: rgba(255,255,255,0.75);
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 6px 0 6px;
+            color: #111827;
+            font-weight: 600;
+        }
+
+        QTabWidget::pane {
+            border: 1px solid #D7DBE5;
+            border-radius: 10px;
+            top: -1px;
+            background: #FFFFFF;
+        }
+        QTabBar::tab {
+            background: #EEF2FF;
+            border: 1px solid #D7DBE5;
+            border-bottom: none;
+            padding: 8px 12px;
+            border-top-left-radius: 10px;
+            border-top-right-radius: 10px;
+            margin-right: 4px;
+        }
+        QTabBar::tab:selected {
+            background: #FFFFFF;
+            font-weight: 600;
+        }
+
+        QPushButton {
+            background: #FFFFFF;
+            border: 1px solid #CBD5E1;
+            border-radius: 10px;
+            padding: 7px 12px;
+        }
+        QPushButton:hover { border-color: #94A3B8; background: #F8FAFC; }
+        QPushButton:pressed { background: #EEF2FF; }
+        QPushButton:disabled { color: #9CA3AF; background: #F3F4F6; border-color: #E5E7EB; }
+
+        QPushButton#primaryButton {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563EB, stop:1 #06B6D4);
+            color: #FFFFFF;
+            border: 1px solid #1D4ED8;
+            font-weight: 600;
+        }
+        QPushButton#primaryButton:hover {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1D4ED8, stop:1 #0891B2);
+        }
+        QPushButton#primaryButton:pressed {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1E40AF, stop:1 #0E7490);
+        }
+
+        QLineEdit, QPlainTextEdit, QTextEdit, QTextBrowser {
+            background: #FFFFFF;
+            border: 1px solid #CBD5E1;
+            border-radius: 10px;
+            padding: 6px 10px;
+            selection-background-color: #2563EB;
+            selection-color: white;
+        }
+        QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QTextBrowser:focus {
+            border-color: #2563EB;
+        }
+
+        QComboBox, QSpinBox, QDoubleSpinBox {
+            background: #FFFFFF;
+            border: 1px solid #CBD5E1;
+            border-radius: 10px;
+            padding: 6px 10px;
+        }
+        QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #2563EB; }
+
+        QProgressBar {
+            border: 1px solid #CBD5E1;
+            border-radius: 9px;
+            background: #FFFFFF;
+            text-align: center;
+            color: #111827;
+        }
+        QProgressBar::chunk {
+            border-radius: 8px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                       stop:0 #2563EB, stop:1 #06B6D4);
+        }
+
+        QMenuBar { background: #FFFFFF; border-bottom: 1px solid #E5E7EB; }
+        QMenuBar::item { padding: 6px 10px; background: transparent; }
+        QMenuBar::item:selected { background: #EEF2FF; border-radius: 8px; }
+        QMenu { background: #FFFFFF; border: 1px solid #D7DBE5; }
+        QMenu::item { padding: 6px 14px; }
+        QMenu::item:selected { background: #EEF2FF; }
+    """
+    try:
+        app.setStyleSheet(qss)
+    except Exception:
+        pass
+
+
 def _about_html() -> str:
     title = html.escape(APP_DISPLAY_NAME)
     version = html.escape(VERSION)
@@ -609,8 +1203,8 @@ _ANSYS_MECHANICAL_SCRIPT_TEMPLATE = r'''# slice2solid -> ANSYS Mechanical (Workb
 #
 # This script tries to:
 #   1) Load layer orientation table from ansys_layers.json
-#   2) Create Named Selections of MESH ELEMENTS per layer (by element centroid Z)
-#   3) Create Coordinate Systems per layer (X along print direction, Z global +Z)
+#   2) Create Named Selections of MESH ELEMENTS per layer (by element centroid along build axis)
+#   3) Create Coordinate Systems per layer (X along print direction, Z along build axis)
 #
 # IMPORTANT:
 # - Mechanical scripting APIs can differ. If this script errors, copy the error text to chat and we will adapt it.
@@ -643,6 +1237,138 @@ import math
 import os
 
 LOG_PATH = None
+
+try:
+    BUILD_AXIS
+except Exception:
+    BUILD_AXIS = "z"
+try:
+    BUILD_SIGN
+except Exception:
+    BUILD_SIGN = 1
+
+try:
+    APPLY_STL_TO_CMB
+except Exception:
+    # When True: element centroids are transformed using STL->CMB before layer selection/CS orientation.
+    # Use this when your imported geometry is in the original STL/CAD coordinates (not already in CMB).
+    APPLY_STL_TO_CMB = True
+try:
+    STL_TO_CMB
+except Exception:
+    # 4x4 row-vector matrix (translation in last row). Injected by slice2solid GUI.
+    STL_TO_CMB = None
+
+LAYER_TO_ELEM = 1.0
+
+
+def _rowvec_mul3(v, m):
+    # out = v @ m  (row-vector convention)
+    return (
+        float(v[0]) * float(m[0][0]) + float(v[1]) * float(m[1][0]) + float(v[2]) * float(m[2][0]),
+        float(v[0]) * float(m[0][1]) + float(v[1]) * float(m[1][1]) + float(v[2]) * float(m[2][1]),
+        float(v[0]) * float(m[0][2]) + float(v[1]) * float(m[1][2]) + float(v[2]) * float(m[2][2]),
+    )
+
+
+def _mat3_inv(a):
+    # Invert a 3x3 matrix (lists) in pure Python.
+    a00, a01, a02 = float(a[0][0]), float(a[0][1]), float(a[0][2])
+    a10, a11, a12 = float(a[1][0]), float(a[1][1]), float(a[1][2])
+    a20, a21, a22 = float(a[2][0]), float(a[2][1]), float(a[2][2])
+    b00 = a11 * a22 - a12 * a21
+    b01 = a02 * a21 - a01 * a22
+    b02 = a01 * a12 - a02 * a11
+    b10 = a12 * a20 - a10 * a22
+    b11 = a00 * a22 - a02 * a20
+    b12 = a02 * a10 - a00 * a12
+    b20 = a10 * a21 - a11 * a20
+    b21 = a01 * a20 - a00 * a21
+    b22 = a00 * a11 - a01 * a10
+    det = a00 * b00 + a01 * b10 + a02 * b20
+    if abs(det) <= 1e-18:
+        return None
+    inv_det = 1.0 / det
+    return [
+        [b00 * inv_det, b01 * inv_det, b02 * inv_det],
+        [b10 * inv_det, b11 * inv_det, b12 * inv_det],
+        [b20 * inv_det, b21 * inv_det, b22 * inv_det],
+    ]
+
+
+_LIN_INV = None
+
+
+def _lin_inv():
+    global _LIN_INV
+    if _LIN_INV is not None:
+        return _LIN_INV
+    if not STL_TO_CMB:
+        _LIN_INV = None
+        return None
+    try:
+        lin = [
+            [float(STL_TO_CMB[0][0]), float(STL_TO_CMB[0][1]), float(STL_TO_CMB[0][2])],
+            [float(STL_TO_CMB[1][0]), float(STL_TO_CMB[1][1]), float(STL_TO_CMB[1][2])],
+            [float(STL_TO_CMB[2][0]), float(STL_TO_CMB[2][1]), float(STL_TO_CMB[2][2])],
+        ]
+        _LIN_INV = _mat3_inv(lin)
+        return _LIN_INV
+    except Exception:
+        _LIN_INV = None
+        return None
+
+
+def _stl_to_cmb_point(xyz):
+    if not (bool(APPLY_STL_TO_CMB) and STL_TO_CMB):
+        return xyz
+    x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+    m = STL_TO_CMB
+    # Translation is given in layer units (typically mm). Scale to element units using LAYER_TO_ELEM.
+    tx = float(m[3][0]) * float(LAYER_TO_ELEM)
+    ty = float(m[3][1]) * float(LAYER_TO_ELEM)
+    tz = float(m[3][2]) * float(LAYER_TO_ELEM)
+    return (
+        x * float(m[0][0]) + y * float(m[1][0]) + z * float(m[2][0]) + tx,
+        x * float(m[0][1]) + y * float(m[1][1]) + z * float(m[2][1]) + ty,
+        x * float(m[0][2]) + y * float(m[1][2]) + z * float(m[2][2]) + tz,
+    )
+
+
+def _cmb_vec_to_model(v):
+    if not (bool(APPLY_STL_TO_CMB) and STL_TO_CMB):
+        return v
+    inv = _lin_inv()
+    if inv is None:
+        return v
+    return _rowvec_mul3(v, inv)
+
+def _axis_index(axis):
+    a = str(axis or "z").strip().lower()
+    if a not in ("x", "y", "z"):
+        a = "z"
+    return {"x": 0, "y": 1, "z": 2}[a]
+
+def _build_sign():
+    try:
+        return 1 if int(BUILD_SIGN) >= 0 else -1
+    except Exception:
+        return 1
+
+def _build_coord(xyz):
+    # build_height = sign * coord_axis
+    xyz = _stl_to_cmb_point(xyz)
+    idx = _axis_index(BUILD_AXIS)
+    s = _build_sign()
+    return float(s) * float(xyz[idx])
+
+def _build_axis_vec_xyz():
+    idx = _axis_index(BUILD_AXIS)
+    s = _build_sign()
+    v = [0.0, 0.0, 0.0]
+    v[idx] = float(s)
+    vv = (float(v[0]), float(v[1]), float(v[2]))
+    return _unit(_cmb_vec_to_model(vv))
 
 def _log(*args):
     msg = " ".join([str(a) for a in args])
@@ -929,11 +1655,11 @@ def _create_named_selection_by_ids(model, name, ids):
     try:
         ns = _with_transaction(lambda: model.AddNamedSelection())
     except Exception as e:
-        _log("ERROR: AddNamedSelection failed for", name, ":", e)
+        _log("ОШИБКА: AddNamedSelection не удалось для", name, ":", e)
         return None
 
     if ns is None:
-        _log("ERROR: AddNamedSelection returned None for", name)
+        _log("ОШИБКА: AddNamedSelection вернул None для", name)
         return None
 
     try:
@@ -944,7 +1670,7 @@ def _create_named_selection_by_ids(model, name, ids):
     try:
         ns.Location = sel
     except Exception as e:
-        _log("ERROR: failed to set NamedSelection.Location for", name, ":", e)
+        _log("ОШИБКА: не удалось установить NamedSelection.Location для", name, ":", e)
         return None
 
     return ns
@@ -1107,7 +1833,7 @@ def _pick_group_direction(group_layers):
 
 def main():
     if "ExtAPI" not in globals():
-        print("ERROR: This script must be run inside ANSYS Mechanical (Workbench).")
+        print("ОШИБКА: этот скрипт нужно запускать внутри ANSYS Mechanical (Workbench).")
         return
 
     def _load_layers():
@@ -1126,7 +1852,7 @@ def main():
                 print("WARN: failed to read ansys_layers.json:", e)
 
         if not os.path.exists(LAYERS_CSV):
-            print("ERROR: ansys_layers.csv not found and JSON could not be loaded.")
+            print("ОШИБКА: файл ansys_layers.csv не найден, а JSON загрузить не удалось.")
             return []
 
         txt = _read_text(LAYERS_CSV)
@@ -1189,22 +1915,24 @@ def main():
     elem_z = {}
     elem_xyz = {}
     ids = list(_iter_element_ids(mesh))
+    x0 = y0 = z0 = 1e300
+    x1 = y1 = z1 = -1e300
     for i, eid in enumerate(ids):
         c = _element_centroid(mesh, eid)
         elem_xyz[eid] = c
-        elem_z[eid] = c[2]
+        try:
+            x0 = min(x0, float(c[0]))
+            y0 = min(y0, float(c[1]))
+            z0 = min(z0, float(c[2]))
+            x1 = max(x1, float(c[0]))
+            y1 = max(y1, float(c[1]))
+            z1 = max(z1, float(c[2]))
+        except Exception:
+            pass
         if (i + 1) % 50000 == 0:
             print("  processed", i + 1, "elements")
 
     print("Elements:", len(ids))
-
-    # Detect unit mismatch between layer Z (typically mm) and Mechanical API coordinates (often meters).
-    try:
-        elem_z_min = min(elem_z.values())
-        elem_z_max = max(elem_z.values())
-    except Exception:
-        elem_z_min = 0.0
-        elem_z_max = 0.0
 
     try:
         layers_z_min = min(float(l.get("z_min", 0.0)) for l in layers)
@@ -1216,23 +1944,36 @@ def main():
     # Scale factor from layer-units -> element-units.
     # If layer Z-range is ~1000x larger, element coords are likely meters while layers are mm.
     layer_to_elem = 1.0
-    if elem_z_max > 1e-12 and layers_z_max > 1e-12:
-        ratio = float(layers_z_max) / float(elem_z_max)
+    try:
+        elem_extent = max(float(x1 - x0), float(y1 - y0), float(z1 - z0))
+    except Exception:
+        elem_extent = 0.0
+    layers_extent = max(0.0, float(layers_z_max) - float(layers_z_min))
+    if elem_extent > 1e-12 and layers_extent > 1e-12:
+        ratio = float(layers_extent) / float(elem_extent)
         if ratio > 200.0 and ratio < 5000.0:
             layer_to_elem = 1.0 / ratio
             _log(
                 "INFO: detected unit mismatch; scaling layer Z by",
                 layer_to_elem,
                 "(layer-units -> element-units).",
-                "elem_z_max=",
-                elem_z_max,
-                "layers_z_max=",
-                layers_z_max,
+                "elem_extent=",
+                elem_extent,
+                "layers_extent=",
+                layers_extent,
             )
         else:
-            _log("INFO: unit check ok. elem_z_max=", elem_z_max, "layers_z_max=", layers_z_max)
+            _log("INFO: unit check ok. elem_extent=", elem_extent, "layers_extent=", layers_extent)
     else:
-        _log("WARN: cannot detect units (zero range). elem_z_max=", elem_z_max, "layers_z_max=", layers_z_max)
+        _log("WARN: cannot detect units (zero range). elem_extent=", elem_extent, "layers_extent=", layers_extent)
+
+    # Apply unit scaling for STL->CMB translation.
+    global LAYER_TO_ELEM
+    LAYER_TO_ELEM = float(layer_to_elem)
+
+    # Now compute element Z in build space.
+    for eid in ids:
+        elem_z[eid] = _build_coord(elem_xyz[eid])
 
     # Pre-sort elements by Z to avoid O(layers * elements) scanning.
     print("Indexing elements by Z...")
@@ -1289,7 +2030,8 @@ def main():
                     model,
                     "CS_" + name,
                     (cx * inv, cy * inv, cz * inv),
-                    (float(d[0]), float(d[1]), float(d[2])),
+                    _unit(_cmb_vec_to_model((float(d[0]), float(d[1]), float(d[2])))),
+                    z_axis_xyz=_build_axis_vec_xyz(),
                 )
                 created_cs += 1
             except System.Exception as e:
@@ -1313,59 +2055,24 @@ main()
 '''
 
 
-_ANSYS_MAPDL_SCRIPT_TEMPLATE = r"""! slice2solid -> MAPDL layer helper (for Workbench Mechanical)
-!
-! Goal:
-! - Create element components per layer (or layer-group) by centroid Z
-! - Assign element coordinate systems (ESYS) per layer using in-plane toolpath angle
-! - Emit a small per-layer report (element counts, angle, confidence)
-!
-! How to use (Mechanical):
-! - Static Structural -> Environment -> Commands
-! - Paste this file contents, or use "Read Input File" if available in your version.
-!
-! Notes:
-! - Units follow your Mechanical model units (recommended: mm). This script uses Z ranges in mm.
-! - This avoids Mechanical API Named Selections (which can be unstable on some builds).
-! - This snippet temporarily enters /PREP7 and then returns to /SOLU so Mechanical can continue solving.
-!
-/PREP7
-CSYS,0
-!
-! Write a small CSV-like report next to solver working directory.
-*CFOPEN,ansys_mapdl_layers_report,txt
-*VWRITE,'name,zmin_mm,zmax_mm,nelem,angle_deg,confidence'
-(A)
-!
-! ---- CONFIG injected by slice2solid ----
-! MIN_CONFIDENCE: {min_conf}
-! GROUP_SIZE_LAYERS: {group_size}
-! CS_BASE_ID: {cs_base}
-!
-! ---- BEGIN LAYERS ----
-{layers_block}
-! ---- END LAYERS ----
-!
-ALLSEL,ALL
-CSYS,0
-*CFCLOS
-/SOLU
-"""
-
-
 _ANSYS_MECHANICAL_SECTION_PLANES_TEMPLATE = r"""# -*- coding: utf-8 -*-
-# slice2solid: Mechanical helper (Section Planes)
+# slice2solid: Mechanical helper (Section Plane aligned to Insight/CMB)
 #
 # What it does:
 # - Creates (or reuses) a single active Section Plane named 'S2S_Slice'
-# - Moves it to a requested Z (mm)
-# - Optional: exports one PNG per layer for comparison with slicer
+# - Moves it to a requested build height Z_MM (mm) in Insight/CMB coordinates (build axis = Z+)
+# - Optional: exports one PNG per layer for quick visual comparison with the slicer preview
+#
+# Why STL->CMB matters:
+# Insight exports toolpaths in CMB coordinates, but the STL/CAD you import into Mechanical is usually in "original" STL coords.
+# This script applies the inverse of STL->CMB to position the Section Plane correctly over the imported geometry.
 #
 # How to use (Mechanical):
 # - Automation -> Scripting -> Open Script... -> select this file -> Run
 # - Edit Z_MM / EXPORT_IMAGES below and re-run as needed
 
 import csv
+import math
 import os
 
 from Ansys.Mechanical.Graphics import GraphicsImageExportFormat, GraphicsImageExportSettings
@@ -1376,10 +2083,100 @@ HERE = os.path.dirname(__file__)
 LAYERS_CSV = os.path.join(HERE, "ansys_layers.csv")
 
 # User knobs
-Z_MM = {z_mm:.6f}  # move slice here (mm)
+Z_MM = {z_mm:.6f}  # build height in CMB (mm)
 EXPORT_IMAGES = {export_images}  # True to export a PNG per layer
 EXPORT_DIR = os.path.join(HERE, "s2s_slices_png")
 PLANE_NAME = "S2S_Slice"
+
+# Geometry placement: apply inverse(STL->CMB) to map CMB plane positions onto imported STL/CAD coordinates.
+APPLY_STL_TO_CMB = {apply_stl_to_cmb}
+STL_TO_CMB = {stl_to_cmb_json}
+
+
+def _mat3_inv(a):
+    a00, a01, a02 = float(a[0][0]), float(a[0][1]), float(a[0][2])
+    a10, a11, a12 = float(a[1][0]), float(a[1][1]), float(a[1][2])
+    a20, a21, a22 = float(a[2][0]), float(a[2][1]), float(a[2][2])
+    b00 = a11 * a22 - a12 * a21
+    b01 = a02 * a21 - a01 * a22
+    b02 = a01 * a12 - a02 * a11
+    b10 = a12 * a20 - a10 * a22
+    b11 = a00 * a22 - a02 * a20
+    b12 = a02 * a10 - a00 * a12
+    b20 = a10 * a21 - a11 * a20
+    b21 = a01 * a20 - a00 * a21
+    b22 = a00 * a11 - a01 * a10
+    det = a00 * b00 + a01 * b10 + a02 * b20
+    if abs(det) <= 1e-18:
+        return None
+    inv_det = 1.0 / det
+    return [
+        [b00 * inv_det, b01 * inv_det, b02 * inv_det],
+        [b10 * inv_det, b11 * inv_det, b12 * inv_det],
+        [b20 * inv_det, b21 * inv_det, b22 * inv_det],
+    ]
+
+
+_LIN_INV = None
+
+
+def _lin_inv():
+    global _LIN_INV
+    if _LIN_INV is not None:
+        return _LIN_INV
+    if not STL_TO_CMB:
+        _LIN_INV = None
+        return None
+    try:
+        lin = [
+            [float(STL_TO_CMB[0][0]), float(STL_TO_CMB[0][1]), float(STL_TO_CMB[0][2])],
+            [float(STL_TO_CMB[1][0]), float(STL_TO_CMB[1][1]), float(STL_TO_CMB[1][2])],
+            [float(STL_TO_CMB[2][0]), float(STL_TO_CMB[2][1]), float(STL_TO_CMB[2][2])],
+        ]
+        _LIN_INV = _mat3_inv(lin)
+        return _LIN_INV
+    except Exception:
+        _LIN_INV = None
+        return None
+
+
+def _cmb_to_model_point(xyz):
+    if not (bool(APPLY_STL_TO_CMB) and STL_TO_CMB):
+        return (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+    inv = _lin_inv()
+    if inv is None:
+        return (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+    tx = float(STL_TO_CMB[3][0])
+    ty = float(STL_TO_CMB[3][1])
+    tz = float(STL_TO_CMB[3][2])
+    x = float(xyz[0]) - tx
+    y = float(xyz[1]) - ty
+    z = float(xyz[2]) - tz
+    # out = (xyz - t) @ inv  (row-vector convention)
+    return (
+        x * float(inv[0][0]) + y * float(inv[1][0]) + z * float(inv[2][0]),
+        x * float(inv[0][1]) + y * float(inv[1][1]) + z * float(inv[2][1]),
+        x * float(inv[0][2]) + y * float(inv[1][2]) + z * float(inv[2][2]),
+    )
+
+
+def _cmb_to_model_vec(v):
+    inv = _lin_inv() if (bool(APPLY_STL_TO_CMB) and STL_TO_CMB) else None
+    if inv is None:
+        return (float(v[0]), float(v[1]), float(v[2]))
+    x, y, z = float(v[0]), float(v[1]), float(v[2])
+    return (
+        x * float(inv[0][0]) + y * float(inv[1][0]) + z * float(inv[2][0]),
+        x * float(inv[0][1]) + y * float(inv[1][1]) + z * float(inv[2][1]),
+        x * float(inv[0][2]) + y * float(inv[1][2]) + z * float(inv[2][2]),
+    )
+
+
+def _unit(v):
+    n = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    if n <= 1e-12:
+        return (0.0, 0.0, 0.0)
+    return (v[0] / n, v[1] / n, v[2] / n)
 
 
 def _load_layers_csv(path):
@@ -1387,14 +2184,17 @@ def _load_layers_csv(path):
     with open(path, "r", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
-            lid = int(row[\"layer_id\"])
-            zmin = float(row[\"z_min_mm\"])
-            zmax = float(row[\"z_max_mm\"])
+            lid = int(row["layer_id"])
+            zmin = float(row["z_min_mm"])
+            zmax = float(row["z_max_mm"])
             layers.append((lid, zmin, zmax))
     return layers
 
 
 def _get_or_create_plane(name):
+    # CMB build axis is always Z+.
+    d_model = _unit(_cmb_to_model_vec((0.0, 0.0, 1.0)))
+
     for p in Graphics.SectionPlanes:
         try:
             if p.Name == name:
@@ -1407,14 +2207,16 @@ def _get_or_create_plane(name):
     sp.Name = name
     sp.Active = True
     sp.Type = SectionPlaneType.AgainstDirection
-    sp.Direction = Vector3D(0, 0, 1)
-    sp.Center = Point([0.0, 0.0, 0.0], \"mm\")
+    sp.Direction = Vector3D(float(d_model[0]), float(d_model[1]), float(d_model[2]))
+    sp.Center = Point([0.0, 0.0, 0.0], "mm")
     Graphics.SectionPlanes.Add(sp)
     return sp
 
 
-def _set_plane_z(plane, z_mm):
-    plane.Center = Point([0.0, 0.0, float(z_mm)], \"mm\")
+def _set_plane_z_cmb(plane, z_mm):
+    # CMB build coordinate: (0,0,z_mm)
+    p_model = _cmb_to_model_point((0.0, 0.0, float(z_mm)))
+    plane.Center = Point([float(p_model[0]), float(p_model[1]), float(p_model[2])], "mm")
 
 
 def _export_png(path):
@@ -1426,103 +2228,39 @@ def _export_png(path):
 
 
 plane = _get_or_create_plane(PLANE_NAME)
-_set_plane_z(plane, Z_MM)
+_set_plane_z_cmb(plane, Z_MM)
 
 if EXPORT_IMAGES:
     os.makedirs(EXPORT_DIR, exist_ok=True)
     layers = _load_layers_csv(LAYERS_CSV)
     for lid, zmin, zmax in layers:
         zmid = 0.5 * (zmin + zmax)
-        _set_plane_z(plane, zmid)
-        out = os.path.join(EXPORT_DIR, f\"slice_L_{{lid:04d}}_z{{zmid:.3f}}mm.png\")
+        _set_plane_z_cmb(plane, zmid)
+        out = os.path.join(EXPORT_DIR, "slice_L_%04d_z%.3fmm.png" % (lid, zmid))
         _export_png(out)
 
-print(\"S2S: Section plane '%s' set to Z=%s mm\" % (PLANE_NAME, Z_MM))  # noqa: T201
+print("S2S: Section plane '%s' set to CMB Z=%.3f mm (APPLY_STL_TO_CMB=%s)" % (PLANE_NAME, Z_MM, APPLY_STL_TO_CMB))  # noqa: T201
 """
 
 
-def _render_ansys_mapdl_script(*, layers: list[dict[str, object]], cfg: JobConfig) -> str:
-    min_conf = float(cfg.ansys_min_confidence)
-    group_size = int(cfg.ansys_group_size_layers) if int(cfg.ansys_group_size_layers) > 0 else 1
-    cs_base = 1000  # avoid conflicts with user-defined CS
-
-    def _grouped() -> list[tuple[int, int, float, float, float | None, float, float]]:
-        groups: dict[int, list[dict[str, object]]] = {}
-        if group_size <= 1:
-            for l in layers:
-                gid = int(l.get("layer_id", 0) or 0)
-                groups.setdefault(gid, []).append(l)
-        else:
-            for l in layers:
-                lid = int(l.get("layer_id", 0) or 0)
-                gid = lid // group_size
-                groups.setdefault(gid, []).append(l)
-
-        out: list[tuple[int, int, float, float, float | None, float, float]] = []
-        for gid in sorted(groups.keys()):
-            gl = groups[gid]
-            lids = [int(x.get("layer_id", 0) or 0) for x in gl]
-            lid0 = min(lids) if lids else int(gid)
-            lid1 = max(lids) if lids else int(gid)
-            zmin = min(float(x.get("z_min", 0.0) or 0.0) for x in gl)
-            zmax = max(float(x.get("z_max", 0.0) or 0.0) for x in gl)
-
-            best_angle = None
-            best_key = None
-            best_conf = 0.0
-            best_w = 0.0
-            for x in gl:
-                conf = float(x.get("confidence", 0.0) or 0.0)
-                w = float(x.get("total_weight", 0.0) or 0.0)
-                a = x.get("angle_deg", None)
-                if a is None:
-                    continue
-                key = (conf, w)
-                if best_key is None or key > best_key:
-                    best_key = key
-                    best_angle = float(a)
-                    best_conf = conf
-                    best_w = w
-
-            out.append((lid0, lid1, zmin, zmax, best_angle, best_conf, best_w))
-        return out
-
-    lines: list[str] = []
-    lines.append("! Each block: select elements by centroid Z; create CM; optionally set ESYS.")
-    for i, (lid0, lid1, zmin, zmax, angle, conf, w) in enumerate(_grouped()):
-        name = f"L_{lid0:04d}" if group_size <= 1 else f"L_{lid0:04d}_{lid1:04d}"
-        csid = cs_base + i
-        a_out = float(angle) if angle is not None else 0.0
-        conf_out = float(conf)
-        lines.append("! ---- " + name + " ----")
-        lines.append("ALLSEL,ALL")
-        lines.append(f"ESEL,S,CENT,Z,{zmin:.6f},{max(zmin, zmax - 1e-9):.6f}")
-        lines.append("*GET,S2S_NELEM,ELEM,0,COUNT")
-        lines.append(f"CM,{name},ELEM")
-        lines.append(f"*SET,S2S_NAME,'{name}'")
-        lines.append(f"*VWRITE,S2S_NAME,{zmin:.6f},{zmax:.6f},S2S_NELEM,{a_out:.6f},{conf_out:.6f}")
-        lines.append("(A20,',',F12.6,',',F12.6,',',I10,',',F10.4,',',F8.6)")
-        lines.append(f"/COM, S2S {name}  Z={zmin:.6f}..{zmax:.6f}  (see ansys_mapdl_layers_report.txt)")
-
-        if angle is not None and float(conf) >= float(min_conf):
-            lines.append(f"! angle_deg={float(angle):.6f} conf={float(conf):.6f} weight={float(w):.6f}")
-            lines.append(f"LOCAL,{csid},0,0,0,0,{float(angle):.6f},0,0")
-            lines.append(f"EMODIF,ALL,ESYS,{csid}")
-        else:
-            lines.append(f"! No ESYS assigned (angle missing or conf<{min_conf:.3f}). conf={float(conf):.6f}")
-
-    return _ANSYS_MAPDL_SCRIPT_TEMPLATE.format(
-        min_conf=f"{min_conf:.6g}",
-        group_size=str(group_size),
-        cs_base=str(cs_base),
-        layers_block="\n".join(lines),
-    )
-
-
-def _render_ansys_mechanical_script(cfg: JobConfig) -> str:
+def _render_ansys_mechanical_script(
+    cfg: JobConfig,
+    *,
+    stl_to_cmb: np.ndarray,
+    apply_stl_to_cmb: bool,
+) -> str:
+    # Embed matrix so the script can work even in IronPython builds without json.
+    m = np.asarray(stl_to_cmb, dtype=float)
+    if m.shape != (4, 4):
+        m = np.eye(4, dtype=float)
+    m_list = [[float(m[r, c]) for c in range(4)] for r in range(4)]
     header = (
         "# -*- coding: utf-8 -*-\n"
         "# Generated by slice2solid\n"
+        "BUILD_AXIS = \"z\"\n"
+        "BUILD_SIGN = 1\n"
+        f"APPLY_STL_TO_CMB = {str(bool(apply_stl_to_cmb))}\n"
+        f"STL_TO_CMB = {json.dumps(m_list, ensure_ascii=False)}\n"
         f"MIN_CONFIDENCE = {float(cfg.ansys_min_confidence):.6g}\n"
         f"GROUP_SIZE_LAYERS = {int(cfg.ansys_group_size_layers)}\n"
         f"CREATE_NAMED_SELECTIONS = {str(bool(cfg.ansys_create_named_selections))}\n"
@@ -1532,10 +2270,24 @@ def _render_ansys_mechanical_script(cfg: JobConfig) -> str:
     return header + _ANSYS_MECHANICAL_SCRIPT_TEMPLATE
 
 
-def _render_ansys_mechanical_section_planes_script(cfg: JobConfig) -> str:
+def _render_ansys_mechanical_section_planes_script(
+    cfg: JobConfig,
+    *,
+    stl_to_cmb: np.ndarray,
+    apply_stl_to_cmb: bool,
+) -> str:
     # Default: Z=0 mm (user can edit Z_MM in the script).
     z_mm = 0.0
-    return _ANSYS_MECHANICAL_SECTION_PLANES_TEMPLATE.format(z_mm=z_mm, export_images="False")
+    m = np.asarray(stl_to_cmb, dtype=float)
+    if m.shape != (4, 4):
+        m = np.eye(4, dtype=float)
+    m_list = [[float(m[r, c]) for c in range(4)] for r in range(4)]
+    return _ANSYS_MECHANICAL_SECTION_PLANES_TEMPLATE.format(
+        z_mm=z_mm,
+        export_images="False",
+        apply_stl_to_cmb=str(bool(apply_stl_to_cmb)),
+        stl_to_cmb_json=json.dumps(m_list, ensure_ascii=False),
+    )
 
 
 def _safe_filename_stem(name: str) -> str:
@@ -1555,7 +2307,20 @@ def _format_token(x: float, *, decimals: int = 3) -> str:
 
 
 def _preview_mesh_stem(cfg: JobConfig) -> str:
-    part = _safe_filename_stem(Path(cfg.placed_stl).stem)
+    part = ""
+    try:
+        if cfg.placed_stl:
+            part = _safe_filename_stem(Path(cfg.placed_stl).stem)
+    except Exception:
+        part = ""
+    if not part:
+        try:
+            if cfg.job_dir:
+                part = _safe_filename_stem(Path(cfg.job_dir).name)
+        except Exception:
+            part = ""
+    if not part:
+        part = "part"
     vox = _format_token(cfg.voxel_size_mm, decimals=3)
     sig = _format_token(cfg.volume_smooth_sigma_vox, decimals=3)
     ds = int(getattr(cfg, "meshing_downsample_factor", 1) or 1)
@@ -1572,29 +2337,65 @@ def _render_cad_import_notes(cfg: JobConfig) -> str:
     suggested_mesh = max(0.5 * v_mesh, 0.02)
     preview_stem = _preview_mesh_stem(cfg)
     return (
-        "slice2solid: заметки для импорта/конвертации в CAD (универсально)\n"
+        "slice2solid: заметки для импорта/конвертации в CAD\n"
         "\n"
-        "Файлы в папке результата:\n"
-        f" - {preview_stem}.stl            (mesh)\n"
-        f" - {preview_stem}_mesh.ply       (mesh; alternative import)\n"
-        " - voxel_points.csv              (point cloud from occupied voxels; x,y,z; no header; may be sampled)\n"
-        " - metadata.json                 (параметры/статистика)\n"
+        "Важно про единицы:\n"
+        " - STL/PLY не хранят единицы. При импорте выбирайте миллиметры (mm).\n"
+        " - Если CAD импортировал как inches, масштаб будет ~25.4x.\n"
         "\n"
-        "Типовой путь в стороннем CAD/mesh-инструменте:\n"
-        f" 1) Импортируйте mesh ({preview_stem}.stl / .ply) в единицах mm\n"
-        " 2) При необходимости выполните Repair/Close Holes/Orient Normals\n"
-        " 3) Если инструмент поддерживает: преобразуйте mesh/implicit в solid (B-Rep)\n"
+        "Файлы в этой папке (CAD/):\n"
+        f" - {preview_stem}.stl            (mesh; основной файл)\n"
+        f" - {preview_stem}_mesh.ply       (mesh; альтернативный импорт)\n"
+        " - voxel_points.csv              (point cloud из занятых вокселей; x,y,z в мм; без заголовка; может быть sampled)\n"
+        "\n"
+        "Параметры расчёта:\n"
+        " - ../metadata.json              (в корне папки результата)\n"
+        "\n"
+        "Быстрый старт (типовой путь в CAD/mesh-инструменте):\n"
+        f" 1) Импортируйте {preview_stem}.stl (или .ply) в единицах mm\n"
+        " 2) Если импорт/конвертация ругается: Repair/Close Holes/Remove self-intersections/Orient Normals\n"
+        " 3) Если нужно тело (solid/B-Rep): конвертируйте mesh/implicit -> solid\n"
         " 4) Экспортируйте STEP/Parasolid (или другой CAD-формат)\n"
         "\n"
-        "Альтернатива (иногда лучше для решёток/заполнений):\n"
-        " - Импорт point cloud (voxel_points.csv) -> построение implicit/volume -> затем solidify -> экспорт STEP\n"
+        "Альтернатива (иногда лучше для решёток/заполнений и «сложных» сеток):\n"
+        " - Импорт point cloud (voxel_points.csv) -> построение implicit/volume -> solidify -> экспорт STEP\n"
         "\n"
         "Подсказка по шагу/разрешению (если инструмент просит spacing/resolution):\n"
-        f" - slice2solid voxel_size_mm = {v:.3f}\n"
-        f" - mesh effective voxel (after meshing downsample): {v_mesh:.3f} mm (ds={ds})\n"
-        f" - starting spacing (from points/voxels): ~{suggested:.3f} mm (~ 0.5 * voxel_size)\n"
-        f" - starting spacing (from mesh): ~{suggested_mesh:.3f} mm (~ 0.5 * mesh effective voxel)\n"
+        f" - slice2solid voxel_size_mm = {v:.3f} мм\n"
+        f" - mesh effective voxel (после downsample при мешинге): {v_mesh:.3f} мм (ds={ds})\n"
+        f" - стартовый spacing (по voxels/points): ~{suggested:.3f} мм (~ 0.5 * voxel_size)\n"
+        f" - стартовый spacing (по mesh): ~{suggested_mesh:.3f} мм (~ 0.5 * mesh effective voxel)\n"
         "   Если слишком медленно: увеличьте spacing. Если теряются детали: уменьшите spacing.\n"
+    )
+
+
+def _render_cae_import_notes(cfg: JobConfig) -> str:
+    preview_stem = _preview_mesh_stem(cfg)
+    return (
+        "slice2solid: заметки для CAE (ANSYS Mechanical)\n"
+        "\n"
+        "Что лежит в этой папке (CAE/):\n"
+        " - ansys_layers.json / ansys_layers.csv  (ориентация печати по слоям + Z-границы слоёв)\n"
+        " - ansys_mechanical_import_layers.py    (скрипт для Mechanical: Named Selections/Coordinate Systems по слоям)\n"
+        " - ansys_mechanical_section_planes.py   (скрипт для Mechanical: сечения по Z и визуальная проверка)\n"
+        "\n"
+        "Типовой рабочий процесс в ANSYS Mechanical:\n"
+        " 1) Импортируйте геометрию детали (CAD-solid или обычный STL) и убедитесь, что единицы mm.\n"
+        " 2) Постройте сетку (Mesh) обычным способом.\n"
+        " 3) Automation -> Scripting -> Run Script -> запустите ansys_mechanical_import_layers.py.\n"
+        " 4) (Опционально) Для визуальной проверки: запустите ansys_mechanical_section_planes.py и меняйте Z_MM.\n"
+        "\n"
+        "Важно про координаты (CMB vs исходный STL):\n"
+        " - Скрипты содержат матрицу STL->CMB из прогона slice2solid и по умолчанию APPLY_STL_TO_CMB=True.\n"
+        " - Если вы импортировали модель уже в координатах CMB, выставьте APPLY_STL_TO_CMB=False внутри скрипта.\n"
+        "\n"
+        "Производительность:\n"
+        " - Если слоёв много, создание Named Selection на каждый слой может быть тяжёлым.\n"
+        " - Увеличьте GROUP_SIZE_LAYERS или выключите CREATE_NAMED_SELECTIONS/CREATE_COORDINATE_SYSTEMS в скрипте.\n"
+        "\n"
+        "Геометрия инфилла из slice2solid (если включали предпросмотр):\n"
+        f" - CAD/{preview_stem}.stl — обычно НЕ нужна для CAE, если цель — учёт направления печати по слоям.\n"
+        " - Обычно для CAE используют «номинальную» геометрию детали, а слойные данные берут из CAE/.\n"
     )
 
 
@@ -1739,7 +2540,7 @@ class _Mesh3DView(QtWidgets.QWidget):
         self._edges_cb.setChecked(True)
         self._light_bg_cb = QtWidgets.QCheckBox("Светлый фон")
         self._light_bg_cb.setChecked(True)
-        self._auto_fit_btn = QtWidgets.QPushButton("Fit")
+        self._auto_fit_btn = QtWidgets.QPushButton("Вписать")
         self._auto_fit_btn.setToolTip("Подогнать камеру под модель")
         self._hint = QtWidgets.QLabel("ЛКМ: вращение · колесо: зум · ПКМ: панорама")
         self._hint.setStyleSheet("color: #6B7280;")
@@ -1758,8 +2559,25 @@ class _Mesh3DView(QtWidgets.QWidget):
         self._mesh_item: object | None = None
         self._edges_item: object | None = None
         self._edges_seg: np.ndarray | None = None
+        self._slice_item: object | None = None
+        self._toolpath_item_range: object | None = None
+        self._toolpath_item_layer: object | None = None
+        self._mesh_for_slice: trimesh.Trimesh | None = None
+        self._zmin: float | None = None
+        self._zmax: float | None = None
+        self._z_phys_min: float | None = None
+        self._z_phys_max: float | None = None
+        # Display offset: place "build plate" at Z=0 and center XY (slicer-like).
+        # The slider/labels stay in original CMB coordinates; views convert to display coords internally.
+        self._disp_offset = np.zeros((3,), dtype=float)
+        # CMB-only: build axis is always Z+.
+        self._build_min: float | None = None
+        self._build_max: float | None = None
+        self._slice_enabled: bool = False
+        self._slice_t: float = 0.5
         self._radius: float = 1.0
         self._edge_rgba = (0.0, 0.0, 0.0, 0.18)
+        self._slice_rgba = (0.93, 0.11, 0.14, 0.95)
 
         self._axis = gl.GLAxisItem()
         self._axis.setSize(10, 10, 10)
@@ -1820,6 +2638,115 @@ class _Mesh3DView(QtWidgets.QWidget):
                 self._edges_item.setVisible(bool(self._edges_cb.isChecked()))
             except Exception:
                 pass
+        if self._slice_item is not None:
+            try:
+                self._slice_item.setVisible(bool(self._slice_enabled))
+            except Exception:
+                pass
+
+    def set_slice(self, *, enabled: bool, t: float) -> None:
+        self._slice_enabled = bool(enabled)
+        self._slice_t = float(max(0.0, min(1.0, float(t))))
+        self._update_slice()
+
+    def set_slice_z(self, *, enabled: bool, z_mm: float) -> None:
+        self._slice_enabled = bool(enabled)
+        if self._build_min is None or self._build_max is None:
+            return
+        z0 = float(self._build_min)
+        z1 = float(self._build_max)
+        if abs(z1 - z0) <= 1e-12:
+            return
+        t = (float(z_mm) - z0) / (z1 - z0)
+        t = float(max(0.0, min(1.0, t)))
+        self._slice_t = float(t)
+        self._update_slice()
+
+    def _update_slice(self) -> None:
+        if not bool(self._slice_enabled):
+            if self._slice_item is not None:
+                try:
+                    self._gl.removeItem(self._slice_item)
+                except Exception:
+                    pass
+                self._slice_item = None
+            return
+        if self._mesh_for_slice is None or self._build_min is None or self._build_max is None:
+            return
+        z0 = float(self._build_min)
+        z1 = float(self._build_max)
+        t = float(self._slice_t)
+        build_z = z0 + t * (z1 - z0)
+
+        axis_i = 2
+        sign = 1
+        axis_coord = float(build_z)
+        axis_coord_centered = axis_coord - float(self._disp_offset[axis_i])
+        origin = [0.0, 0.0, 0.0]
+        origin[axis_i] = float(axis_coord_centered)
+        normal = [0.0, 0.0, 0.0]
+        normal[axis_i] = float(sign)
+
+        try:
+            sec = self._mesh_for_slice.section(plane_origin=origin, plane_normal=normal)
+        except Exception:
+            sec = None
+        if sec is None:
+            if self._slice_item is not None:
+                try:
+                    self._gl.removeItem(self._slice_item)
+                except Exception:
+                    pass
+                self._slice_item = None
+            return
+
+        try:
+            polylines = sec.discrete
+        except Exception:
+            polylines = []
+        if not polylines:
+            if self._slice_item is not None:
+                try:
+                    self._gl.removeItem(self._slice_item)
+                except Exception:
+                    pass
+                self._slice_item = None
+            return
+
+        segs: list[np.ndarray] = []
+        seg_budget = 200_000
+        seg_count = 0
+        for pl in polylines:
+            arr = np.asarray(pl, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[1] != 3 or arr.shape[0] < 2:
+                continue
+            a = arr[:-1]
+            b = arr[1:]
+            s = np.empty((a.shape[0] * 2, 3), dtype=np.float32)
+            s[0::2] = a
+            s[1::2] = b
+            segs.append(s)
+            seg_count += int(a.shape[0])
+            if seg_count >= seg_budget:
+                break
+        if not segs:
+            return
+        seg = np.vstack(segs)
+
+        if self._slice_item is not None:
+            try:
+                self._gl.removeItem(self._slice_item)
+            except Exception:
+                pass
+            self._slice_item = None
+        try:
+            item = gl.GLLinePlotItem(pos=seg, mode="lines", color=self._slice_rgba, width=2, antialias=True)
+            item.setGLOptions("translucent")
+            self._gl.addItem(item)
+            self._slice_item = item
+            self._apply_visibility()
+        except Exception:
+            self._slice_item = None
 
     @staticmethod
     def _unique_edges(faces: np.ndarray, *, max_edges: int) -> np.ndarray:
@@ -1848,6 +2775,29 @@ class _Mesh3DView(QtWidgets.QWidget):
             except Exception:
                 pass
             self._edges_item = None
+        if self._slice_item is not None:
+            try:
+                self._gl.removeItem(self._slice_item)
+            except Exception:
+                pass
+            self._slice_item = None
+        if self._toolpath_item_range is not None:
+            try:
+                self._gl.removeItem(self._toolpath_item_range)
+            except Exception:
+                pass
+            self._toolpath_item_range = None
+        if self._toolpath_item_layer is not None:
+            try:
+                self._gl.removeItem(self._toolpath_item_layer)
+            except Exception:
+                pass
+            self._toolpath_item_layer = None
+        self._mesh_for_slice = None
+        self._zmin = None
+        self._zmax = None
+        self._build_min = None
+        self._build_max = None
 
         if mesh is None or mesh.faces is None or mesh.vertices is None or len(mesh.faces) == 0:
             return
@@ -1859,22 +2809,52 @@ class _Mesh3DView(QtWidgets.QWidget):
 
         try:
             bounds = np.asarray(mesh.bounds, dtype=np.float32)
-            center = bounds.mean(axis=0)
-            verts = verts - center[None, :]
+            self._z_phys_min = float(bounds[0, 2])
+            self._z_phys_max = float(bounds[1, 2])
+            # Slicer-like placement:
+            # - build plate is Z=0 (so the part is above XY plane)
+            # - XY is centered for nicer navigation
+            disp = bounds.mean(axis=0).astype(float)
+            disp[2] = float(bounds[0, 2])
+            self._disp_offset = np.asarray(disp, dtype=float)
+            verts = verts - self._disp_offset[None, :]
             ext = bounds[1] - bounds[0]
             radius = float(np.linalg.norm(ext) * 0.6 + 1e-6)
         except Exception:
+            self._z_phys_min = None
+            self._z_phys_max = None
+            self._disp_offset = np.zeros((3,), dtype=float)
             radius = 1.0
         self._radius = float(radius)
 
-        meshdata = gl.MeshData(vertexes=verts, faces=faces)
         try:
-            meshdata.vertexNormals()
+            # Build range stays in original CMB coordinates.
+            self._build_min = float(bounds[0, 2])
+            self._build_max = float(bounds[1, 2])
         except Exception:
-            pass
+            self._build_min = None
+            self._build_max = None
+
+        try:
+            self._mesh_for_slice = trimesh.Trimesh(vertices=verts.astype(np.float64), faces=faces.astype(np.int64), process=False)
+            bb = np.asarray(self._mesh_for_slice.bounds, dtype=float)
+            self._zmin = float(bb[0, 2])
+            self._zmax = float(bb[1, 2])
+        except Exception:
+            self._mesh_for_slice = None
+            self._zmin = None
+            self._zmax = None
+
+        meshdata = gl.MeshData(vertexes=verts, faces=faces)
+        have_nan = False
+        try:
+            n = meshdata.vertexNormals()
+            have_nan = (n is None) or (not np.isfinite(np.asarray(n)).all())
+        except Exception:
+            have_nan = True
         item = gl.GLMeshItem(
             meshdata=meshdata,
-            smooth=True,
+            smooth=not bool(have_nan),
             shader="shaded",
             color=QtGui.QColor(color).getRgbF(),
             drawFaces=True,
@@ -1912,6 +2892,46 @@ class _Mesh3DView(QtWidgets.QWidget):
 
         self._fit_camera()
         self._apply_visibility()
+        self._update_slice()
+
+    def _set_toolpath_item(self, attr: str, segments: np.ndarray | None, *, rgba: tuple[float, float, float, float]) -> None:
+        item = getattr(self, attr, None)
+        if item is not None:
+            try:
+                self._gl.removeItem(item)
+            except Exception:
+                pass
+            setattr(self, attr, None)
+        if segments is None:
+            return
+        try:
+            seg = np.asarray(segments, dtype=np.float32)
+            if seg.ndim != 3 or seg.shape[1:] != (2, 3) or seg.shape[0] == 0:
+                return
+            # Convert from CMB coords to display coords.
+            try:
+                seg = seg - self._disp_offset.reshape((1, 1, 3)).astype(np.float32)
+            except Exception:
+                pass
+            pts = seg.reshape((-1, 3))
+            # Use thicker lines for better readability on dense parts.
+            width = 3 if attr.endswith("_layer") else 1
+            item = gl.GLLinePlotItem(pos=pts, mode="lines", color=rgba, width=width, antialias=True)
+            item.setGLOptions("translucent")
+            self._gl.addItem(item)
+            setattr(self, attr, item)
+        except Exception:
+            setattr(self, attr, None)
+
+    def set_toolpath_segments(self, segments: np.ndarray | None) -> None:
+        # Backward-compatible: one overlay (current layer).
+        self.set_toolpath_layers(range_segments=None, layer_segments=segments)
+
+    def set_toolpath_layers(self, *, range_segments: np.ndarray | None, layer_segments: np.ndarray | None) -> None:
+        # Range overlay (faint) + current layer (red).
+        self._set_toolpath_item("_toolpath_item_range", range_segments, rgba=(0.10, 0.70, 0.25, 0.12))
+        # Highly visible highlight for the current layer.
+        self._set_toolpath_item("_toolpath_item_layer", layer_segments, rgba=(1.00, 0.00, 1.00, 1.00))
 
 
 class _MeshVTKView(QtWidgets.QWidget):
@@ -1939,14 +2959,7 @@ class _MeshVTKView(QtWidgets.QWidget):
         self._edges_cb.setChecked(True)
         self._light_bg_cb = QtWidgets.QCheckBox("Светлый фон")
         self._light_bg_cb.setChecked(True)
-        self._clip_cb = QtWidgets.QCheckBox("Сечение")
-        self._clip_cb.setChecked(False)
-        self._clip_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self._clip_slider.setRange(0, 1000)
-        self._clip_slider.setValue(500)
-        self._clip_slider.setEnabled(False)
-        self._clip_slider.setToolTip("Плоскость сечения вдоль Z (для осмотра внутренности)")
-        self._fit_btn = QtWidgets.QPushButton("Fit")
+        self._fit_btn = QtWidgets.QPushButton("Вписать")
         self._fit_btn.setToolTip("Подогнать камеру под модель")
         hint = QtWidgets.QLabel("ЛКМ: вращение · колесо: зум · ПКМ: панорама")
         hint.setStyleSheet("color: #6B7280;")
@@ -1954,35 +2967,47 @@ class _MeshVTKView(QtWidgets.QWidget):
         toolbar_layout.addSpacing(8)
         toolbar_layout.addWidget(self._light_bg_cb, 0)
         toolbar_layout.addSpacing(8)
-        toolbar_layout.addWidget(self._clip_cb, 0)
-        toolbar_layout.addWidget(self._clip_slider, 1)
-        toolbar_layout.addSpacing(8)
         toolbar_layout.addWidget(self._fit_btn, 0)
         toolbar_layout.addStretch(1)
         toolbar_layout.addWidget(hint, 0)
         layout.addWidget(toolbar, 0)
 
-        self._plot = QtInteractor(self)
-        self._plot.set_background("#F3F4F6")
-        layout.addWidget(self._plot.interactor, 1)
+        self._plot = None
+        try:
+            self._plot = QtInteractor(self)
+            self._plot.set_background("#F3F4F6")
+            layout.addWidget(self._plot.interactor, 1)
+        except Exception as e:
+            # Fallback placeholder; the higher-level widget may choose another backend on next run,
+            # or user can set S2S_PREVIEW_BACKEND=gl to force a stable backend.
+            lbl = QtWidgets.QLabel(
+                "VTK preview backend is unavailable on this system/session.\n"
+                "Set environment variable S2S_PREVIEW_BACKEND=gl to use the OpenGL backend.\n\n"
+                f"Error: {e}"
+            )
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color: #B91C1C; padding: 12px;")
+            layout.addWidget(lbl, 1)
 
         self._poly: pv.PolyData | None = None
         self._actor = None
+        self._toolpath_actor = None
+        self._disp_offset = np.zeros((3,), dtype=float)
         self._bounds: np.ndarray | None = None
+        self._clip_enabled: bool = False
+        self._clip_t: float = 0.5
 
         self._edges_cb.toggled.connect(self._update_render)
         self._light_bg_cb.toggled.connect(self._update_render)
-        self._clip_cb.toggled.connect(self._toggle_clip)
-        self._clip_slider.valueChanged.connect(self._update_render)
         self._fit_btn.clicked.connect(self._fit_camera)
 
-    def _toggle_clip(self, on: bool) -> None:
-        self._clip_slider.setEnabled(bool(on))
-        self._update_render()
-
     @staticmethod
-    def _to_poly(mesh: trimesh.Trimesh) -> pv.PolyData:
+    def _to_poly(mesh: trimesh.Trimesh, *, disp_offset: np.ndarray) -> pv.PolyData:
         verts = np.asarray(mesh.vertices, dtype=np.float32)
+        try:
+            verts = verts - np.asarray(disp_offset, dtype=np.float32).reshape((1, 3))
+        except Exception:
+            pass
         faces = np.asarray(mesh.faces, dtype=np.int64)
         if verts.size == 0 or faces.size == 0:
             return pv.PolyData()
@@ -1992,20 +3017,39 @@ class _MeshVTKView(QtWidgets.QWidget):
         return poly
 
     def _fit_camera(self) -> None:
+        if self._plot is None:
+            return
         try:
             self._plot.reset_camera()
+        except Exception:
+            pass
+        # Make Z the "up" axis (matches Insight/CMB build coordinates).
+        try:
+            cam = self._plot.camera
+            cam.SetViewUp(0.0, 0.0, 1.0)
         except Exception:
             pass
 
     def set_mesh(self, mesh: trimesh.Trimesh | None, *, stats_text: str = "", color: str = "#6BCB77") -> None:
         self._stats.setText(stats_text)
+        if self._plot is None:
+            return
         self._plot.clear()
         self._poly = None
+        self._toolpath_actor = None
         self._bounds = None
+        self._disp_offset = np.zeros((3,), dtype=float)
         if mesh is None or mesh.faces is None or mesh.vertices is None or len(mesh.faces) == 0:
             self._plot.render()
             return
-        poly = self._to_poly(mesh)
+        try:
+            b = np.asarray(mesh.bounds, dtype=float)
+            disp = b.mean(axis=0)
+            disp[2] = float(b[0, 2])  # build plate at Z=0 (slicer-like)
+            self._disp_offset = np.asarray(disp, dtype=float)
+        except Exception:
+            self._disp_offset = np.zeros((3,), dtype=float)
+        poly = self._to_poly(mesh, disp_offset=self._disp_offset)
         self._poly = poly
         try:
             self._bounds = np.array(poly.bounds, dtype=float)
@@ -2015,16 +3059,91 @@ class _MeshVTKView(QtWidgets.QWidget):
         self._update_render()
         self._fit_camera()
 
+    def _set_toolpath_actor(
+        self,
+        attr: str,
+        segments: np.ndarray | None,
+        *,
+        color: str,
+        opacity: float,
+        line_width: int,
+        tubes: bool,
+    ) -> None:
+        actor = getattr(self, attr, None)
+        if actor is not None:
+            try:
+                self._plot.remove_actor(actor)
+            except Exception:
+                pass
+            setattr(self, attr, None)
+        if segments is None:
+            return
+        try:
+            seg = np.asarray(segments, dtype=np.float32)
+            if seg.ndim != 3 or seg.shape[1:] != (2, 3) or seg.shape[0] == 0:
+                return
+            try:
+                seg = seg - self._disp_offset.reshape((1, 1, 3)).astype(np.float32)
+            except Exception:
+                pass
+            pts = seg.reshape((-1, 3))
+            n = int(pts.shape[0])
+            lines = np.empty((int(n // 2), 3), dtype=np.int64)
+            lines[:, 0] = 2
+            lines[:, 1] = np.arange(0, n, 2, dtype=np.int64)
+            lines[:, 2] = np.arange(1, n, 2, dtype=np.int64)
+            poly = pv.PolyData(pts)
+            poly.lines = lines.ravel()
+            actor = self._plot.add_mesh(
+                poly,
+                color=color,
+                opacity=float(opacity),
+                line_width=int(line_width),
+                render_lines_as_tubes=bool(tubes),
+                lighting=False,
+            )
+            setattr(self, attr, actor)
+        except Exception:
+            setattr(self, attr, None)
+
+    def set_toolpath_segments(self, segments: np.ndarray | None) -> None:
+        # Backward-compatible: one overlay (current layer).
+        self.set_toolpath_layers(range_segments=None, layer_segments=segments)
+
+    def set_toolpath_layers(self, *, range_segments: np.ndarray | None, layer_segments: np.ndarray | None) -> None:
+        if self._plot is None:
+            return
+        if self._poly is None:
+            return
+        self._set_toolpath_actor("_toolpath_actor_range", range_segments, color="#16A34A", opacity=0.12, line_width=1, tubes=False)
+        # Highly visible highlight for the current layer.
+        self._set_toolpath_actor("_toolpath_actor_layer", layer_segments, color="#FF00FF", opacity=1.0, line_width=4, tubes=True)
+        try:
+            self._plot.render()
+        except Exception:
+            pass
+
     def _update_render(self) -> None:
+        if self._plot is None:
+            return
         if self._poly is None:
             return
         poly = self._poly
-        if self._clip_cb.isChecked() and self._bounds is not None:
-            z0, z1 = float(self._bounds[4]), float(self._bounds[5])
-            t = float(self._clip_slider.value()) / 1000.0
+        if bool(self._clip_enabled) and self._bounds is not None:
+            axis_i = 2
+            a0 = float(self._bounds[axis_i * 2 + 0])
+            a1 = float(self._bounds[axis_i * 2 + 1])
+            z0 = a0
+            z1 = a1
+            t = float(self._clip_t)
             z = z0 + t * (z1 - z0)
+            axis_coord = float(z)
+            origin = [0.0, 0.0, 0.0]
+            origin[axis_i] = float(axis_coord)
+            normal = [0.0, 0.0, 0.0]
+            normal[axis_i] = 1.0
             try:
-                poly = poly.clip(normal=(0, 0, 1), origin=(0, 0, z), invert=False)
+                poly = poly.clip(normal=tuple(normal), origin=tuple(origin), invert=False)
             except Exception:
                 poly = self._poly
 
@@ -2035,11 +3154,30 @@ class _MeshVTKView(QtWidgets.QWidget):
             smooth_shading=True,
             show_edges=bool(self._edges_cb.isChecked()),
             edge_color="#1F2937" if self._light_bg_cb.isChecked() else "#E5E7EB",
-            ambient=0.35 if self._light_bg_cb.isChecked() else 0.25,
-            diffuse=0.8,
-            specular=0.15,
-            specular_power=20.0,
+            ambient=0.45 if self._light_bg_cb.isChecked() else 0.30,
+            diffuse=0.85,
+            specular=0.25,
+            specular_power=35.0,
         )
+        # Slicer-like contour overlay at the clipping plane.
+        if bool(self._clip_enabled) and self._bounds is not None:
+            try:
+                axis_i = 2
+                a0 = float(self._bounds[axis_i * 2 + 0])
+                a1 = float(self._bounds[axis_i * 2 + 1])
+                z0 = a0
+                z1 = a1
+                t = float(self._clip_t)
+                z = z0 + t * (z1 - z0)
+                axis_coord = float(z)
+                origin = [0.0, 0.0, 0.0]
+                origin[axis_i] = float(axis_coord)
+                normal = [0.0, 0.0, 0.0]
+                normal[axis_i] = 1.0
+                contour = self._poly.slice(normal=tuple(normal), origin=tuple(origin))
+                self._plot.add_mesh(contour, color="#DC2626", line_width=2)
+            except Exception:
+                pass
         try:
             self._plot.set_background("#F3F4F6" if self._light_bg_cb.isChecked() else "#111317")
         except Exception:
@@ -2052,31 +3190,47 @@ class _MeshVTKView(QtWidgets.QWidget):
         self._plot.show_axes()
         self._plot.render()
 
+    def set_slice(self, *, enabled: bool, t: float) -> None:
+        self._clip_enabled = bool(enabled)
+        self._clip_t = float(max(0.0, min(1.0, float(t))))
+        self._update_render()
 
-class MeshCompareWidget(QtWidgets.QWidget):
-    def __init__(self):
+    def set_slice_z(self, *, enabled: bool, z_mm: float) -> None:
+        self._clip_enabled = bool(enabled)
+        if self._bounds is None:
+            return
+        # Incoming z_mm is in CMB coordinates; display is shifted so build plate is at z=0.
+        try:
+            z_mm = float(z_mm) - float(self._disp_offset[2])
+        except Exception:
+            z_mm = float(z_mm)
+        axis_i = 2
+        a0 = float(self._bounds[axis_i * 2 + 0])
+        a1 = float(self._bounds[axis_i * 2 + 1])
+        z0 = a0
+        z1 = a1
+        if abs(z1 - z0) <= 1e-12:
+            return
+        t = (float(z_mm) - z0) / (z1 - z0)
+        t = float(max(0.0, min(1.0, t)))
+        self._clip_t = float(t)
+        self._update_render()
+
+
+class MeshSingleWidget(QtWidgets.QWidget):
+    def __init__(self, *, title: str = "Модель"):
         super().__init__()
-        layout = QtWidgets.QHBoxLayout(self)
+        layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        backend = os.environ.get("S2S_PREVIEW_BACKEND", "auto").strip().lower()
-        if backend == "vtk":
-            view_cls = _MeshVTKView if _lazy_import_pyvista() else _Mesh2DView
-        elif backend == "gl":
-            view_cls = _Mesh3DView if gl is not None else _Mesh2DView
-        elif backend == "2d":
-            view_cls = _Mesh2DView
-        else:
-            # Default to pyqtgraph OpenGL when available: it's typically more robust than VTK in Qt layouts.
-            if gl is not None:
-                view_cls = _Mesh3DView
-            elif _lazy_import_pyvista():
-                view_cls = _MeshVTKView
-            else:
-                view_cls = _Mesh2DView
-        self.before = view_cls(title="До (после marching cubes)")
-        self.after = view_cls(title="После (после сглаживания)")
-        layout.addWidget(self.before, 1)
-        layout.addWidget(self.after, 1)
+        view_cls = _select_view_cls()
+        # VTK can fail to create an OpenGL context on some systems (drivers / Remote Desktop / debugger terminals).
+        # In that case, fall back to OpenGL (pyqtgraph) or 2D.
+        try:
+            self.view = view_cls(title=title)
+        except Exception:
+            fallback = _Mesh3DView if gl is not None else _Mesh2DView
+            self.view = fallback(title=title)
+        layout.addWidget(self.view, 1)
 
     @staticmethod
     def _fmt_stats(stats: dict, key: str) -> str:
@@ -2097,90 +3251,206 @@ class MeshCompareWidget(QtWidgets.QWidget):
         except Exception:
             return ""
 
-    def set_meshes(self, before: trimesh.Trimesh | None, after: trimesh.Trimesh | None, stats: dict | None = None) -> None:
+    def set_mesh(self, mesh: trimesh.Trimesh | None, *, stats: dict | None = None, key: str = "after") -> None:
         stats = stats or {}
-        self.before.set_mesh(before, stats_text=self._fmt_stats(stats, "before"), color="#4D96FF")
-        self.after.set_mesh(after, stats_text=self._fmt_stats(stats, "after"), color="#6BCB77")
+        self.view.set_mesh(mesh, stats_text=self._fmt_stats(stats, key), color="#6BCB77")
+
+    def set_slice_z(self, *, enabled: bool, z_mm: float) -> None:
+        fn = getattr(self.view, "set_slice_z", None)
+        if callable(fn):
+            fn(enabled=bool(enabled), z_mm=float(z_mm))
+
+    def set_slice(self, *, enabled: bool, t: float) -> None:
+        fn = getattr(self.view, "set_slice", None)
+        if callable(fn):
+            fn(enabled=bool(enabled), t=float(t))
+
+    def set_toolpath_layers(self, *, range_segments: np.ndarray | None, layer_segments: np.ndarray | None) -> None:
+        fn = getattr(self.view, "set_toolpath_layers", None)
+        if callable(fn):
+            fn(range_segments=range_segments, layer_segments=layer_segments)
+            return
+        fn2 = getattr(self.view, "set_toolpath_segments", None)
+        if callable(fn2):
+            fn2(layer_segments)
+
+
+def _build_lightweight_display_mesh(mesh: trimesh.Trimesh, *, target_faces: int = 600_000) -> trimesh.Trimesh:
+    """
+    Builds a lightweight display mesh that remains renderable in Qt OpenGL/VTK views.
+
+    Naive face sub-sampling can look like a "point cloud" and may generate NaN normals in pyqtgraph OpenGL shaders
+    (degenerate triangles). We use a simple deterministic vertex-clustering decimation instead.
+    """
+    if target_faces <= 0:
+        return mesh
+    if mesh.faces is None or mesh.vertices is None:
+        return mesh
+
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        return mesh
+    if verts.ndim != 2 or verts.shape[1] != 3:
+        return mesh
+
+    n_faces = int(faces.shape[0])
+    if n_faces <= int(target_faces):
+        return mesh
+
+    # Rough target vertex count for stable shading.
+    target_vertices = max(50_000, min(int(0.55 * float(target_faces)), 1_200_000))
+
+    vmin = verts.min(axis=0)
+    vmax = verts.max(axis=0)
+    diag = float(np.linalg.norm(vmax - vmin))
+    if not np.isfinite(diag) or diag <= 1e-9:
+        return mesh
+    ext = vmax - vmin
+    # Use bbox volume heuristic too (diag-only tends to over-decimate for thin parts).
+    vol = float(max(ext[0] * ext[1] * ext[2], 1e-12))
+    cell_diag = diag / (float(target_vertices) ** (1.0 / 3.0))
+    cell_vol = (vol / float(target_vertices)) ** (1.0 / 3.0)
+    cell = max(min(float(cell_diag), float(cell_vol)), 1e-6)
+
+    q = np.floor((verts - vmin[None, :]) / float(cell)).astype(np.int64)
+    q0 = q.min(axis=0)
+    q = q - q0[None, :]
+    spans = q.max(axis=0) + 1
+    spans = np.maximum(spans, 1)
+    keys = q[:, 0] + spans[0] * (q[:, 1] + spans[1] * q[:, 2])
+    uniq, inv = np.unique(keys, return_inverse=True)
+    if uniq.size < 3:
+        return mesh
+
+    sums = np.zeros((uniq.size, 3), dtype=np.float64)
+    counts = np.zeros((uniq.size,), dtype=np.int64)
+    np.add.at(sums, inv, verts)
+    np.add.at(counts, inv, 1)
+    counts = np.maximum(counts, 1)
+    verts2 = sums / counts[:, None]
+
+    faces2 = inv[faces.reshape(-1)].reshape((-1, 3)).astype(np.int64, copy=False)
+    a = faces2[:, 0]
+    b = faces2[:, 1]
+    c = faces2[:, 2]
+    ok = (a != b) & (b != c) & (a != c)
+    faces2 = faces2[ok]
+    if faces2.shape[0] < 10:
+        return mesh
+
+    tri = verts2[faces2]
+    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    area2 = np.einsum("ij,ij->i", n, n)
+    eps = (1e-10 * diag) ** 2
+    faces2 = faces2[area2 > eps]
+    if faces2.shape[0] < 10:
+        return mesh
+
+    used = np.unique(faces2.reshape(-1))
+    remap = np.full((verts2.shape[0],), -1, dtype=np.int64)
+    remap[used] = np.arange(used.shape[0], dtype=np.int64)
+    verts3 = verts2[used]
+    faces3 = remap[faces2].astype(np.int64, copy=False)
+
+    out = trimesh.Trimesh(vertices=verts3, faces=faces3, process=False)
+    out.metadata.update(getattr(mesh, "metadata", {}) or {})
+    out.metadata["s2s_preview_decimated_from_faces"] = n_faces
+    out.metadata["s2s_preview_decimated_to_faces"] = int(faces3.shape[0])
+    out.metadata["s2s_preview_decimated_from_vertices"] = int(verts.shape[0])
+    out.metadata["s2s_preview_decimated_to_vertices"] = int(verts3.shape[0])
+    out.metadata["s2s_preview_decimation_cell"] = float(cell)
+    return out
 
 
 _HELP_HTML = """
+<style>
+  body { font-family: 'Segoe UI', sans-serif; font-size: 13px; color: #111827; }
+  h2 { margin: 0 0 10px 0; }
+  h3 { margin: 18px 0 8px 0; }
+  h4 { margin: 14px 0 8px 0; }
+  p, li { line-height: 1.35; }
+  code { background: #F3F4F6; padding: 1px 5px; border-radius: 6px; }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+  th, td { border: 1px solid #E5E7EB; padding: 8px; vertical-align: top; text-align: left; }
+  th { background: #F3F4F6; }
+  tr:nth-child(even) td { background: #FAFAFB; }
+</style>
 <h2>slice2solid - Справка</h2>
 
-<p><b>Подсказки в интерфейсе:</b> наведите курсор на параметр, чтобы увидеть tooltip. Также можно нажать <b>Shift+F1</b> и кликнуть по элементу, чтобы открыть “What’s This?”.</p>
+<p><b>Подсказки в интерфейсе:</b> наведите курсор на параметр, чтобы увидеть подсказку. Также можно нажать <b>Shift+F1</b> и кликнуть по элементу, чтобы открыть "What's This?".</p>
 
 <h3>1) Что выбрать в Insight</h3>
 <ol>
-  <li><b>Simulation export (*.txt)</b>: Insight -&gt; Toolpaths -&gt; Simulation data export.</li>
-  <li><b>Slicer job folder (ssys_*)</b>: папка задания, где лежат <code>toolpathParams.*</code>, <code>sliceParams.*</code> (нужно для auto-ширины дорожки).</li>
-  <li><b>Placed STL (*.stl)</b>: STL после ориентации/размещения на столе в Insight.</li>
-  <li><b>Папка результата (Output folder)</b>: сюда пишутся файлы.</li>
+  <li><b>Папка после слайсинга (ssys_*)</b>: папка задания Insight. Внутри должны быть <code>*-simulation-data.txt</code>, <code>toolpathParams.*</code> и (для геометрии) <code>*.stl</code>.</li>
+  <li><b>Результат</b>: по умолчанию пишется в <code>&lt;ssys_*&gt;/slice2solid_out</code> (другую папку можно выбрать в разделе «Дополнительно»).</li>
 </ol>
 
 <h3>2) Вкладка “CAD / Геометрия”</h3>
 <ul>
-  <li>Выход: <code>*_s2s_preview_structure.stl</code> + (опционально) <code>*_s2s_preview_structure_mesh.ply</code>, <code>voxel_points.csv</code>, <code>cad_import_notes.txt</code> + <code>metadata.json</code> (в имени mesh-файлов есть имя детали и параметры).</li>
-  <li><b>Пресеты</b> — быстрые наборы настроек. Выберите пресет и нажмите <b>Применить</b>. При ручных изменениях режим становится <b>Custom</b>.</li>
-  <li><b>Voxel size</b> - главный "качество&lt;-&gt;скорость". Меньше -&gt; точнее, но сильно тяжелее по RAM/времени и размеру STL.</li>
-  <li><b>Downsample для meshing</b> — упрощает построение поверхности (marching cubes) по разреженному объёму (каждый N-й воксель): резко ускоряет meshing и уменьшает STL, но может “съесть” тонкие элементы.</li>
-  <li><b>Volume smoothing</b> (sigma, vox) сглаживает сам воксельный объём перед построением поверхности — уменьшает “ступеньки”.</li>
-  <li><b>Mesh smoothing</b> сглаживает уже готовую сетку (Laplacian) — убирает “рывки”, но может замыливать мелкие детали.</li>
-  <li>Если появляются "лишние перемычки/линии" между отдельными дорожками: включите <b>Ignore travel jumps</b> (порог подбирается автоматически и зависит от bead radius) и/или увеличьте <b>Remove noise</b>.</li>
-  <li>Если есть мелкие "островки" сетки вокруг: увеличьте <b>Remove mesh islands</b>.</li>
+  <li>Выход (в папке результата): <code>CAD/*_s2s_preview_structure.stl</code> + (опционально) <code>CAD/*_s2s_preview_structure_mesh.ply</code>, <code>CAD/voxel_points.csv</code>, <code>CAD/cad_import_notes.txt</code> + <code>metadata.json</code>.</li>
+  <li><b>Пресеты</b> — быстрые наборы настроек. Выберите пресет — настройки применятся сразу. При ручных изменениях режим станет <b>Custom</b>.</li>
+  <li><b>Размер вокселя (Voxel size)</b> — главный компромисс «качество/скорость». Меньше -&gt; точнее, но заметно тяжелее по RAM/времени и размеру STL.</li>
+  <li><b>Разрежение (downsample)</b> — построение поверхности (marching cubes) по разреженному объёму (каждый N-й воксель): ускоряет расчёт и уменьшает STL, но может “съесть” тонкие элементы.</li>
+  <li><b>Сглаживание объёма</b> (sigma, vox) сглаживает воксельный объём перед построением поверхности — уменьшает “ступеньки”.</li>
+  <li><b>Сглаживание сетки</b> (Laplacian iterations) сглаживает уже готовую сетку — убирает “рывки”, но может замыливать мелкие детали.</li>
+  <li>Если появляются "лишние перемычки/линии" между отдельными дорожками: включите <b>Фильтр перемещений (travel jumps)</b> и/или увеличьте <b>Удаление шума</b>.</li>
+  <li>Если вокруг есть мелкие "островки" сетки: увеличьте <b>Удаление островков сетки</b>.</li>
 </ul>
 
 <h4>2.0 Файлы результата: что чем является и что куда грузить</h4>
-<table border="1" cellpadding="6" cellspacing="0">
+<table>
   <tr><th>Файл</th><th>Что это</th><th>Когда использовать (CAD/CAE)</th></tr>
   <tr>
-    <td><code>*_s2s_preview_structure.stl</code></td>
-    <td>Mesh восстановленной <b>явной</b> структуры печати (периметры/заполнение). Обычно очень большой.</td>
-    <td><b>CAD</b>: визуализация/архив/mesh-body, попытка конвертировать в B-Rep. <b>CAE</b>: только если нужна именно явная геометрия инфилла (иначе слишком тяжело).</td>
+    <td><code>CAD/*_s2s_preview_structure.stl</code></td>
+    <td>Сетка восстановленной <b>явной</b> структуры печати (периметры/заполнение). Обычно очень большой файл.</td>
+    <td><b>CAD</b>: визуализация/архив/сеточное тело (mesh body), попытка конвертации в B-Rep. <b>CAE</b>: только если нужна именно явная геометрия инфилла (иначе слишком тяжело).</td>
   </tr>
   <tr>
-    <td><code>*_s2s_preview_structure_mesh.ply</code></td>
+    <td><code>CAD/*_s2s_preview_structure_mesh.ply</code></td>
     <td>То же самое, что STL, но в PLY (часто быстрее/стабильнее импорт в некоторых инструментах).</td>
     <td><b>CAD/CAE</b>: пробовать вместо STL, если импорт STL проблемный/медленный.</td>
   </tr>
   <tr>
-    <td><code>*_s2s_preview_structure_mesh_before.ply</code></td>
-    <td>Служебный экспорт mesh <b>до</b> сглаживания/лечения.</td>
-    <td>Для сравнения/диагностики, обычно не нужен для импорта.</td>
-  </tr>
-  <tr>
-    <td><code>*_s2s_preview_structure_healed.stl</code></td>
+    <td><code>CAD/*_s2s_preview_structure_healed.stl</code></td>
     <td>Результат <b>Mesh Healer</b>: попытка сделать сетку более "чистой" для импорта.</td>
     <td>Выбирать, если исходный STL плохо импортируется (дырки/нормали/мусор).</td>
   </tr>
   <tr>
-    <td><code>ansys_layers.json</code> / <code>ansys_layers.csv</code></td>
+    <td><code>CAE/ansys_layers.json</code> / <code>CAE/ansys_layers.csv</code></td>
     <td>Ориентация/угол дорожек по слоям Z + confidence (для анизотропии).</td>
-    <td><b>CAE (ANSYS)</b>: ключевой результат. Обычно используется вместе с геометрией детали (placed STL или CAD-solid) — без явного инфилла.</td>
+    <td><b>CAE (ANSYS)</b>: ключевой результат. Обычно используется вместе с геометрией детали (CAD-solid / обычный STL) — без явного инфилла.</td>
   </tr>
   <tr>
-    <td><code>ansys_mechanical_import_layers.py</code></td>
+    <td><code>CAE/ansys_mechanical_import_layers.py</code></td>
     <td>Скрипт импорта слоёв/ориентаций в ANSYS Mechanical.</td>
     <td><b>CAE (ANSYS)</b>: запускать в Mechanical, чтобы создать нужные сущности/настройки по слоям.</td>
   </tr>
   <tr>
-    <td><code>voxel_points.csv</code></td>
+    <td><code>CAE/ansys_mechanical_section_planes.py</code></td>
+    <td>Визуальная проверка: Section Plane по высоте (Z в CMB) + опциональный экспорт PNG по слоям.</td>
+    <td><b>CAE (ANSYS)</b>: удобно “глазами” сравнить слои/ориентацию с предпросмотром слайсера.</td>
+  </tr>
+  <tr>
+    <td><code>CAD/voxel_points.csv</code></td>
     <td>Облако точек занятых вокселей (x,y,z), без заголовка.</td>
     <td><b>CAD</b>: иногда лучше для решёток (implicit/volume -&gt; solidify). <b>CAE</b>: редко, скорее для альтернативной реконструкции.</td>
   </tr>
   <tr>
-    <td><code>cad_import_notes.txt</code></td>
+    <td><code>CAD/cad_import_notes.txt</code></td>
     <td>Короткая памятка по импорту и стартовым параметрам spacing/resolution.</td>
     <td><b>CAD</b>: открыть и следовать рекомендациям.</td>
   </tr>
   <tr>
     <td><code>metadata.json</code></td>
-    <td>Параметры запуска, матрица (STL-&gt;CMB), статистика mesh/вокселей.</td>
+    <td>Параметры запуска, матрица (STL-&gt;CMB), статистика сетки/вокселей.</td>
     <td>Для контроля единиц/матрицы/параметров, воспроизводимости и диагностики.</td>
   </tr>
 </table>
 
-<p><b>Как получить STEP/твердое тело в стороннем CAD/mesh-инструменте:</b><br/>
-Импортируйте mesh (STL/PLY) -&gt; при необходимости Repair/Close/Orient Normals -&gt; затем (если поддерживается) Convert to Solid (B-Rep) -&gt; Export STEP.<br/>
-Если включён <b>CAD bundle</b>, рядом с STL будет файл <code>cad_import_notes.txt</code> с подсказками по стартовым параметрам (spacing/resolution) на основе параметров slice2solid.</p>
+<p><b>Как получить STEP/твердое тело в стороннем CAD или инструменте работы с сеткой:</b><br/>
+Импортируйте сетку (STL/PLY) -&gt; при необходимости Repair/Close/Orient Normals -&gt; затем (если поддерживается) Convert to Solid (B-Rep) -&gt; Export STEP.<br/>
+Если включён <b>пакет для CAD (CAD bundle)</b>, файлы лежат в подпапке <code>CAD/</code> (например, <code>CAD/cad_import_notes.txt</code>).</p>
 
 <h4>2.1 Mesh Healer (CAD)</h4>
 <ul>
@@ -2192,98 +3462,100 @@ _HELP_HTML = """
 </ul>
 
 <h3>Быстрый гайд по параметрам (что крутить)</h3>
-<table border="1" cellpadding="6" cellspacing="0">
+<table>
   <tr><th>Параметр</th><th>Эффект</th><th>Плюсы</th><th>Минусы</th><th>Стартовые значения</th></tr>
   <tr>
-    <td><b>CAD bundle</b></td>
+    <td><b>Пакет для CAD (CAD bundle)</b></td>
     <td>Пишет доп. файлы для удобного импорта: <code>*.ply</code>, <code>voxel_points.csv</code>, <code>cad_import_notes.txt</code>.</td>
-    <td>Упрощает импорт/подбор spacing, даёт point cloud для альтернативного восстановления.</td>
+    <td>Упрощает импорт и подбор шага/разрешения (spacing/resolution), даёт облако точек (point cloud) для альтернативного восстановления.</td>
     <td>Доп. файлы в папке результата.</td>
     <td>Включено</td>
   </tr>
   <tr>
     <td><b>Mesh Healer (CAD)</b></td>
     <td>Автоматически исправляет типовые дефекты сетки после экспорта STL.</td>
-    <td>Повышает шанс корректного импорта и "watertight" сетки.</td>
+    <td>Повышает шанс корректного импорта и получения замкнутой (watertight) сетки.</td>
     <td>Может не помочь при очень сложной/самопересекающейся сетке; aggressive может удалять проблемные области.</td>
     <td>Выключено; включать при проблемах импорта</td>
   </tr>
   <tr>
-    <td><b>Voxel size (mm)</b></td>
+    <td><b>Размер вокселя (Voxel size, mm)</b></td>
     <td>Размер ячейки сетки, из которой строится поверхность.</td>
-    <td>Меньше → более гладкая/точная поверхность.</td>
-    <td>Меньше → RAM/время растут очень резко (≈ кубически), STL тяжелее.</td>
-    <td>0.10–0.25 (если грубо → 0.07 → 0.05)</td>
+    <td>Меньше - более гладкая/точная поверхность.</td>
+    <td>Меньше - нагрузка по RAM/времени растёт очень резко (примерно кубически), STL тяжелее.</td>
+    <td>0.10-0.25 (если грубо - 0.07-0.05)</td>
   </tr>
   <tr>
-    <td><b>Bead radius limit</b></td>
+    <td><b>Ограничение радиуса дорожки (Bead radius limit)</b></td>
     <td>Ограничивает “толщину” дорожки при вокселизации.</td>
     <td>Стабилизирует результат, убирает случайные завышения.</td>
-    <td>Слишком мало → “худые” ребра/разрывы.</td>
-    <td>Auto; вручную обычно 1.0–2.5 мм</td>
+    <td>Слишком мало - "худые" ребра/разрывы.</td>
+    <td>Auto; вручную обычно 1.0-2.5 мм</td>
   </tr>
   <tr>
-    <td><b>Ignore travel jumps</b></td>
+    <td><b>Фильтр перемещений (travel jumps)</b></td>
     <td>Не заполнять материал по длинным перемещениям (travel) между разорванными траекториями.</td>
     <td>Убирает ложные перемычки.</td>
-    <td>Если порог слишком строгий → могут появиться разрывы (редко).</td>
+    <td>Если порог слишком строгий - могут появиться разрывы (редко).</td>
     <td>Включено (recommended)</td>
   </tr>
   <tr>
-    <td><b>Remove noise (min voxels)</b></td>
+    <td><b>Удаление шума (min voxels)</b></td>
     <td>Удаляет маленькие “пятна” вокселей до построения сетки.</td>
     <td>Убирает мусор, ускоряет marching cubes.</td>
-    <td>Слишком много → можно потерять тонкие элементы.</td>
-    <td>100–500</td>
+    <td>Слишком много - можно потерять тонкие элементы.</td>
+    <td>100-500</td>
   </tr>
   <tr>
-    <td><b>Remove mesh islands (min faces)</b></td>
+    <td><b>Удаление островков сетки (min faces)</b></td>
     <td>Удаляет мелкие куски сетки после построения поверхности.</td>
     <td>Убирает островки/пылинки.</td>
-    <td>Слишком много → удалит полезные мелкие детали.</td>
-    <td>1000–10000</td>
+    <td>Слишком много - удалит полезные мелкие детали.</td>
+    <td>1000-10000</td>
   </tr>
   <tr>
-    <td><b>Volume smoothing (sigma, vox)</b></td>
+    <td><b>Сглаживание объёма (sigma, vox)</b></td>
     <td>Гауссово сглаживание объёма (в вокселях) перед marching cubes.</td>
     <td>Лучше “убирает ступеньки” без сильной потери формы.</td>
-    <td>Слишком много → тонкие стенки могут “съесться”.</td>
-    <td>0.8–1.5 (начать с 1.0)</td>
+    <td>Слишком много - тонкие стенки могут "съесться".</td>
+    <td>0.8-1.5 (начать с 1.0)</td>
   </tr>
   <tr>
-    <td><b>Mesh smoothing (iterations)</b></td>
+    <td><b>Сглаживание сетки (iterations)</b></td>
     <td>Laplacian smoothing по вершинам после marching cubes.</td>
-    <td>Убирает "рывки", делает поверхность приятнее для импорта/ремонта в CAD/mesh-инструментах.</td>
-    <td>Слишком много → усадка/замыливание деталей.</td>
-    <td>10–30 (начать с 15)</td>
+    <td>Убирает "рывки", делает поверхность приятнее для импорта/исправления в CAD и инструментах работы с сеткой.</td>
+    <td>Слишком много - усадка/замыливание деталей.</td>
+    <td>10-30 (начать с 15)</td>
   </tr>
   <tr>
-    <td><b>Downsample для meshing</b></td>
+    <td><b>Разрежение (downsample)</b></td>
     <td>Строит поверхность по разреженному объёму (каждый N-й воксель).</td>
     <td>Сильно ускоряет marching cubes и уменьшает STL.</td>
     <td>Может “съесть” тонкие элементы и огрубить поверхность.</td>
-    <td>1; для ускорения 2–4</td>
+    <td>1; для ускорения 2-4</td>
   </tr>
 </table>
 
 <h3>3) Вкладка “Просмотр”</h3>
 <ul>
-  <li>Показывает результат <b>последнего запуска</b>: слева сетка сразу после marching cubes, справа — после сглаживания.</li>
+  <li>Показывает результат <b>последнего запуска</b>: восстановленную модель (после сглаживания).</li>
   <li>Если сетка слишком большая, для интерактивности она автоматически прореживается (в статистике видно <code>preview: ... ds=N</code>).</li>
-  <li>Если доступен VTK/pyvista: есть режим <b>Сечение</b> по Z и отображение <b>рёбер</b>; кнопка <b>Fit</b> подгоняет камеру.</li>
+  <li>Есть <b>сечение</b> по оси печати (Z+ в CMB), контур на плоскости и <b>траектория</b> (один слой / до слоя / все слои).</li>
 </ul>
 
 <h3>4) Вкладка “ANSYS / CAE”</h3>
 <ul>
-  <li>Выход: <code>ansys_layers.json</code>, <code>ansys_layers.csv</code>, <code>ansys_mechanical_import_layers.py</code>, <code>ansys_mapdl_layers.mac</code>.</li>
-  <li>Идея: назначить ортотропию по слоям (X вдоль печати, Z — build direction).</li>
+  <li>Выход (в папке результата): <code>CAE/ansys_layers.json</code>, <code>CAE/ansys_layers.csv</code>, <code>CAE/ansys_mechanical_import_layers.py</code>, <code>CAE/ansys_mechanical_section_planes.py</code>.</li>
+  <li>Идея: назначить ортотропию по слоям (X вдоль печати, Z - ось построения (build direction)).</li>
   <li><b>Пресеты</b> на вкладке ANSYS меняют параметры генерируемого Mechanical-скрипта (группировка слоёв, порог confidence, создавать ли NS/CS).</li>
 </ul>
 <ol>
-  <li>Откройте ANSYS Mechanical, импортируйте геометрию, сделайте <b>Mesh</b>.</li>
-  <li>Mechanical → Automation → Scripting → <b>Run Script…</b></li>
-  <li>Выберите <code>ansys_mechanical_import_layers.py</code> из папки результата.</li>
-  <li>После выполнения появятся Named Selections <code>L_0000</code>, <code>L_0001</code>… и Coordinate Systems <code>CS_L_0000</code>… (если API доступен в вашей конфигурации).</li>
+  <li>Откройте ANSYS Mechanical, импортируйте геометрию, постройте сетку (Mesh).</li>
+  <li>Mechanical -&gt; Automation -&gt; Scripting -&gt; <b>Run Script...</b></li>
+  <li>Выберите <code>CAE/ansys_mechanical_import_layers.py</code> из папки результата.</li>
+  <li>По умолчанию скрипт применяет матрицу STL -&gt; CMB (как в Insight). Если ваша модель уже в CMB - установите в скрипте <code>APPLY_STL_TO_CMB = False</code>.</li>
+  <li>После выполнения появятся Named Selections <code>L_0000</code>, <code>L_0001</code>... и Coordinate Systems <code>CS_L_0000</code>... (если API доступен в вашей конфигурации).</li>
+  <li>Для визуальной проверки по слоям: запустите <code>CAE/ansys_mechanical_section_planes.py</code> и меняйте <code>Z_MM</code>.</li>
 </ol>
 
 <h3>Блок “Результаты”</h3>
@@ -2300,9 +3572,11 @@ _HELP_HTML = """
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("slice2solid — Восстановление структуры (MVP)")
+        self.setWindowTitle("slice2solid - Восстановление структуры (MVP)")
         self.setWindowIcon(_load_app_icon())
-        self.resize(920, 640)
+        self.resize(1500, 920)
+        self.setMinimumSize(1200, 780)
+        self._settings = QtCore.QSettings()
 
         def _set_help(widget: QtWidgets.QWidget, *, title: str, body: str, pros: str = "", cons: str = "", tip: str = "") -> None:
             parts = [f"<b>{title}</b><br>{body}"]
@@ -2316,13 +3590,23 @@ class MainWindow(QtWidgets.QMainWindow):
             widget.setToolTip(html)
             widget.setWhatsThis(html)
 
-        help_menu = self.menuBar().addMenu("Справка")
-        about_action = QtGui.QAction("О программе", self)
-        about_action.triggered.connect(self._show_about)
-        help_menu.addAction(about_action)
-        howto_action = QtGui.QAction("Как пользоваться", self)
-        howto_action.triggered.connect(self._show_help)
-        help_menu.addAction(howto_action)
+        def _with_hint(widget: QtWidgets.QWidget, hint: str) -> QtWidgets.QWidget:
+            wrap = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(wrap)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(10)
+            row.addWidget(widget, 0)
+            if isinstance(hint, QtWidgets.QLabel):
+                lab = hint
+            else:
+                lab = QtWidgets.QLabel(str(hint))
+                lab.setWordWrap(True)
+                lab.setStyleSheet("QLabel { color: #64748B; font-size: 12px; }")
+            row.addWidget(lab, 1)
+            return wrap
+
+        # Справка достаточно подробно расписана в интерфейсе (tooltips + вкладка "Справка"),
+        # поэтому отдельные actions/диалоги в меню не добавляем.
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -2331,6 +3615,10 @@ class MainWindow(QtWidgets.QMainWindow):
         main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         main_splitter.setChildrenCollapsible(False)
         layout.addWidget(main_splitter, 1)
+        try:
+            main_splitter.setSizes([650, 250])
+        except Exception:
+            pass
 
         scrollbar_css = """
             QScrollBar:vertical { width: 14px; }
@@ -2346,81 +3634,78 @@ class MainWindow(QtWidgets.QMainWindow):
         main_splitter.addWidget(top_panel)
 
         header = QtWidgets.QLabel(
-            "Цель: получить `*_s2s_preview_structure.stl`, который можно импортировать как mesh в CAD/CAE и, при необходимости,\n"
-            "сконвертировать в твердое тело (STEP) средствами стороннего CAD/mesh-инструмента.\n"
+            "Цель: получить `*_s2s_preview_structure.stl`, который можно импортировать как сетку (mesh) в CAD/CAE и, при необходимости,\n"
+            "преобразовать в твердое тело (STEP) средствами стороннего CAD/инструмента для работы с сетками.\n"
             "Поддержки/подложка (`Type=0`) игнорируются; используется только траектория модели (`Type=1`).\n"
-            "Подсказки: наведите курсор на параметр (или Shift+F1 → клик)."
-            "Пайплайн: Import Mesh → Repair/Close/Orient Normals → (если поддерживается) Convert to Solid (B-Rep) → Export STEP."
+            "Подсказки: наведите курсор на параметр (или Shift+F1 -> клик).\n"
+            "Шаги: Import Mesh -> Repair/Close/Orient Normals -> (если поддерживается) Convert to Solid (B-Rep) -> Export STEP."
         )
         header.setWordWrap(True)
+        header.setStyleSheet(
+            "QLabel { background: #F8FAFC; border: 1px solid #E5E7EB; border-radius: 10px; padding: 10px; color: #334155; font-size: 12px; }"
+        )
         top_layout.addWidget(header)
 
         io_group = QtWidgets.QGroupBox("Шаг 1 - Входные файлы")
         io_form = QtWidgets.QFormLayout(io_group)
         top_layout.addWidget(io_group)
 
-        self.sim_edit = QtWidgets.QLineEdit()
-        self.sim_edit.setPlaceholderText(r"Например: ...\part-table-simulation-data.txt")
-        self.sim_edit.setToolTip(
-            "Файл экспорта Stratasys Insight: Toolpaths → Simulation data export.\n"
-            "Внутри есть таблица X/Y/Z/Bead Area/Type/BeadMode и матрица STL↔CMB."
-        )
-        self.sim_btn = QtWidgets.QPushButton("Обзор…")
-        sim_row = QtWidgets.QHBoxLayout()
-        sim_row.addWidget(self.sim_edit, 1)
-        sim_row.addWidget(self.sim_btn)
-        io_form.addRow("Экспорт симуляции (*.txt):", sim_row)
-
         self.job_edit = QtWidgets.QLineEdit()
         self.job_edit.setPlaceholderText(r"Например: ...\ssys_part-table")
         self.job_edit.setToolTip(
             "Папка задания Stratasys Insight (ssys_*).\n"
-            "Нужна для чтения `toolpathParams.*` и автоматического определения ширины дорожки."
+            "Внутри должны быть:\n"
+            "- `*-simulation-data.txt` (Insight: Toolpaths -> Simulation data export)\n"
+            "- `*.stl` (копия исходной геометрии)\n"
+            "- `toolpathParams.*` (для авто-радиуса дорожки)\n\n"
+            "В GUI достаточно выбрать только эту папку."
         )
-        self.job_btn = QtWidgets.QPushButton("Обзор…")
+        self.job_btn = QtWidgets.QPushButton("Обзор...")
         job_row = QtWidgets.QHBoxLayout()
         job_row.addWidget(self.job_edit, 1)
         job_row.addWidget(self.job_btn)
-        io_form.addRow("Папка задания (ssys_*):", job_row)
+        io_form.addRow("Папка после слайсинга (ssys_*):", job_row)
 
-        self.stl_edit = QtWidgets.QLineEdit()
-        self.stl_edit.setPlaceholderText(r"Например: ...\part-table.stl (placed STL)")
-        self.stl_edit.setToolTip(
-            "Placed STL — STL после ориентации/размещения на столе в Insight.\n"
-            "Используется как эталонная геометрия/габариты для вокселизации и проверки координат."
-        )
-        self.stl_btn = QtWidgets.QPushButton("Обзор…")
-        stl_row = QtWidgets.QHBoxLayout()
-        stl_row.addWidget(self.stl_edit, 1)
-        stl_row.addWidget(self.stl_btn)
-        io_form.addRow("Placed STL (*.stl):", stl_row)
+        # Advanced: output folder override (default: <ssys_*>/slice2solid_out).
+        self.advanced_toggle = QtWidgets.QToolButton()
+        self.advanced_toggle.setText("Дополнительно")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setChecked(False)
+        self.advanced_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.advanced_toggle.setArrowType(QtCore.Qt.ArrowType.RightArrow)
+        io_form.addRow("", self.advanced_toggle)
+
+        self.advanced_panel = QtWidgets.QWidget()
+        adv_form = QtWidgets.QFormLayout(self.advanced_panel)
+        adv_form.setContentsMargins(0, 0, 0, 0)
 
         self.out_edit = QtWidgets.QLineEdit()
-        self.out_edit.setPlaceholderText(
-            r"Папка результата (*_s2s_preview_structure.stl/ply, cad_import_notes.txt, metadata.json, ...)"
-        )
+        self.out_edit.setPlaceholderText(r"По умолчанию: <ssys_*>\\slice2solid_out")
         _set_help(
             self.out_edit,
             title="Папка результата",
-            body="Папка, куда программа запишет результаты.",
+            body="Папка, куда программа запишет результаты. Если оставить пусто, используется `<ssys_*>/slice2solid_out`.",
             pros="Можно запускать несколько раз в разные папки и сравнивать параметры.",
             cons="Большие STL могут занимать много места.",
-            tip="Для экспериментов создайте отдельную папку на каждый прогон (например, out_0p10_sigma1).",
+            tip="Обычно не трогают. Для экспериментов можно указать отдельную папку (например, out_0p10_sigma1).",
         )
-        self.out_btn = QtWidgets.QPushButton("Обзор…")
+        self.out_btn = QtWidgets.QPushButton("Обзор...")
         out_row = QtWidgets.QHBoxLayout()
         out_row.addWidget(self.out_edit, 1)
         out_row.addWidget(self.out_btn)
-        io_form.addRow("Папка результата:", out_row)
+        adv_form.addRow("Папка результата (override):", out_row)
+        self.advanced_panel.setVisible(False)
+        io_form.addRow("", self.advanced_panel)
 
         tabs = QtWidgets.QTabWidget()
+        self.main_tabs = tabs
         top_layout.addWidget(tabs, 1)
 
         # --- Tab: CAD / Geometry preview ---
         geometry_tab = QtWidgets.QWidget()
         tabs.addTab(geometry_tab, "CAD / Геометрия")
         geo_outer = QtWidgets.QVBoxLayout(geometry_tab)
-        geo_outer.setContentsMargins(0, 0, 0, 0)
+        geo_outer.setContentsMargins(10, 8, 10, 10)
 
         geo_scroll = QtWidgets.QScrollArea()
         geo_scroll.setWidgetResizable(True)
@@ -2433,39 +3718,74 @@ class MainWindow(QtWidgets.QMainWindow):
         geo_scroll_content = QtWidgets.QWidget()
         geo_scroll.setWidget(geo_scroll_content)
         geo_layout = QtWidgets.QVBoxLayout(geo_scroll_content)
-        geo_layout.setContentsMargins(0, 0, 0, 0)
+        geo_layout.setContentsMargins(10, 10, 10, 10)
+        geo_layout.setSpacing(10)
 
         geo_intro = QtWidgets.QLabel(
             "Режим CAD: восстановление внутренней структуры и экспорт `*_s2s_preview_structure.stl`.\n"
-            "Дальше: импорт в сторонний CAD/mesh-инструмент → repair/solidify (если нужно) → экспорт STEP."
+            "Дальше: импорт в сторонний CAD или инструмент работы с сеткой -> исправление сетки (если нужно) -> преобразование в тело (если поддерживается) -> экспорт STEP."
         )
         geo_intro.setWordWrap(True)
+        geo_intro.setStyleSheet(
+            "QLabel { background: #EEF2FF; border: 1px solid #C7D2FE; border-radius: 10px; padding: 10px; color: #1E3A8A; }"
+        )
         geo_layout.addWidget(geo_intro)
 
-        geo_group = QtWidgets.QGroupBox("Параметры геометрии")
-        geo_form = QtWidgets.QFormLayout(geo_group)
-        geo_layout.addWidget(geo_group)
+        geo_basic_group = QtWidgets.QGroupBox("Основные параметры")
+        geo_form = QtWidgets.QFormLayout(geo_basic_group)
+        geo_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+        geo_form.setHorizontalSpacing(14)
+        geo_form.setVerticalSpacing(10)
+        geo_layout.addWidget(geo_basic_group)
 
-        self.export_geometry = QtWidgets.QCheckBox("Сгенерировать STL (предпросмотр) (*_s2s_preview_structure.stl)")
+        self.export_geometry = QtWidgets.QCheckBox("Сгенерировать STL предпросмотра")
         self.export_geometry.setChecked(True)
-        self.export_geometry.setToolTip("Отключите, если нужен только экспорт для ANSYS (карта слоёв).")
+        self.export_geometry.setToolTip(
+            "Пишет `CAD/*_s2s_preview_structure.stl` (обычно большой mesh).\n"
+            "Отключите, если нужен только экспорт для ANSYS (карта слоёв)."
+        )
         self.export_geometry.setWhatsThis(self.export_geometry.toolTip())
         geo_form.addRow("Выходная геометрия:", self.export_geometry)
 
-        self.export_bundle = QtWidgets.QCheckBox(
-            "Экспортировать CAD bundle (PLY + voxel_points.csv + cad_import_notes.txt)"
-        )
+        self.export_bundle = QtWidgets.QCheckBox("Экспортировать пакет для CAD (PLY + точки + заметки)")
         self.export_bundle.setChecked(True)
         self.export_bundle.setToolTip(
-            "Доп. универсальные файлы для внешних CAD/mesh-инструментов: PLY (mesh), voxel_points.csv (point cloud из вокселей)\n"
-            "и cad_import_notes.txt (краткие подсказки по импорту/spacing на основе параметров slice2solid)."
+            "Доп. универсальные файлы для внешних CAD/mesh-инструментов:\n"
+            "- `CAD/*_s2s_preview_structure_mesh.ply` (mesh)\n"
+            "- `CAD/voxel_points.csv` (point cloud из вокселей)\n"
+            "- `CAD/cad_import_notes.txt` (подсказки по импорту/spacing)"
         )
         self.export_bundle.setWhatsThis(self.export_bundle.toolTip())
-        geo_form.addRow("CAD bundle:", self.export_bundle)
+        geo_form.addRow("Пакет для CAD:", self.export_bundle)
+
+        self.geo_advanced_toggle = QtWidgets.QToolButton()
+        self.geo_advanced_toggle.setText("Продвинутые параметры")
+        self.geo_advanced_toggle.setCheckable(True)
+        self.geo_advanced_toggle.setChecked(False)
+        self.geo_advanced_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.geo_advanced_toggle.setArrowType(QtCore.Qt.ArrowType.RightArrow)
+        geo_layout.addWidget(self.geo_advanced_toggle, 0)
+
+        self.geo_advanced_panel = QtWidgets.QWidget()
+        geo_adv_layout = QtWidgets.QVBoxLayout(self.geo_advanced_panel)
+        geo_adv_layout.setContentsMargins(0, 0, 0, 0)
+        geo_adv_layout.setSpacing(10)
+        self.geo_advanced_panel.setVisible(False)
+        geo_layout.addWidget(self.geo_advanced_panel, 0)
+
+        geo_adv_group = QtWidgets.QGroupBox("Продвинутые параметры")
+        geo_adv_form = QtWidgets.QFormLayout(geo_adv_group)
+        geo_adv_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+        geo_adv_form.setHorizontalSpacing(14)
+        geo_adv_form.setVerticalSpacing(10)
+        geo_adv_layout.addWidget(geo_adv_group, 0)
 
         heal_group = QtWidgets.QGroupBox("Mesh Healer (CAD)")
         heal_form = QtWidgets.QFormLayout(heal_group)
-        geo_layout.addWidget(heal_group)
+        heal_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+        heal_form.setHorizontalSpacing(14)
+        heal_form.setVerticalSpacing(10)
+        geo_adv_layout.addWidget(heal_group, 0)
 
         self.heal_enable = QtWidgets.QCheckBox("Автоматически исправить сетку после экспорта STL (*_healed.stl)")
         self.heal_enable.setChecked(False)
@@ -2488,6 +3808,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.close_holes_max.setDecimals(2)
         self.close_holes_max.setSingleStep(0.5)
         self.close_holes_max.setValue(2.0)
+        self.close_holes_max.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.close_holes_max.setFixedWidth(140)
         self.close_holes_max.setToolTip(
             "Максимальный размер дырки (мм) для закрытия.\n"
             "Примечание: MeshLab использует лимит по числу рёбер контура; программа переводит мм в рёбра по оценке."
@@ -2500,7 +3822,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.heal_report_path_edit = QtWidgets.QLineEdit()
         self.heal_report_path_edit.setPlaceholderText("Путь (опционально). Пусто = рядом со STL")
-        self.heal_report_path_btn = QtWidgets.QPushButton("Обзор…")
+        self.heal_report_path_btn = QtWidgets.QPushButton("Обзор...")
         report_row = QtWidgets.QHBoxLayout()
         report_row.addWidget(self.heal_report_path_edit, 1)
         report_row.addWidget(self.heal_report_path_btn)
@@ -2511,25 +3833,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.voxel_size.setSingleStep(0.05)
         self.voxel_size.setValue(0.25)
         self.voxel_size.setDecimals(3)
+        self.voxel_size.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.voxel_size.setFixedWidth(140)
+        self._voxel_rec_label = QtWidgets.QLabel()
+        self._voxel_rec_label.setWordWrap(True)
+        self._voxel_rec_label.setStyleSheet("QLabel { color: #64748B; font-size: 12px; }")
         _set_help(
             self.voxel_size,
             title="Размер вокселя (Voxel size), мм",
             body="Размер вокселя (мм): из этой сетки строится поверхность (marching cubes).",
-            pros="Меньше → более гладкая/точная поверхность.",
-            cons="Меньше → очень сильный рост RAM/времени и размера STL (приблизительно кубически).",
-            tip="Если поверхность “ступеньками”: сначала включите сглаживание объёма (Volume smoothing, ≈1.0), и только потом уменьшайте voxel size.",
+            pros="Меньше - более гладкая/точная поверхность.",
+            cons="Меньше - нагрузка по RAM/времени и размер STL растут очень резко (примерно кубически).",
+            tip="Если поверхность \"ступеньками\": сначала включите сглаживание объёма (Volume smoothing, примерно 1.0), и только потом уменьшайте voxel size.",
         )
-        geo_form.addRow("Размер вокселя (мм):", self.voxel_size)
+        geo_form.addRow(
+            "Размер вокселя (мм):",
+            _with_hint(self.voxel_size, self._voxel_rec_label),
+        )
 
         self.auto_radius = QtWidgets.QCheckBox("Авто (из параметров слайсера)")
         self.auto_radius.setChecked(True)
         _set_help(
             self.auto_radius,
-            title="Bead radius limit — Auto",
+            title="Авто-радиус дорожки",
             body="Автоматически берёт радиус дорожки из параметров слайсера (папка ssys_*).",
             pros="Обычно даёт правильную толщину дорожек без ручной настройки.",
-            cons="Если ssys_* не выбран/не распознан → auto недоступен.",
-            tip="Если auto не сработал или есть “жирные” дорожки — снимите Auto и задайте лимит вручную.",
+            cons="Если ssys_* не выбран/не распознан - авто-режим недоступен.",
+            tip="Если авто-режим не сработал или есть \"жирные\" дорожки - снимите Auto и задайте лимит вручную.",
         )
         self.max_radius = QtWidgets.QDoubleSpinBox()
         self.max_radius.setRange(0.1, 10.0)
@@ -2537,64 +3867,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self.max_radius.setValue(1.5)
         self.max_radius.setDecimals(2)
         self.max_radius.setEnabled(False)
+        self.max_radius.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.max_radius.setFixedWidth(140)
         _set_help(
             self.max_radius,
-            title="Bead radius limit (mm)",
-            body="Ограничение максимального радиуса ‘сферы’ при вокселизации (из Bead Area).",
+            title="Ограничение радиуса дорожки (мм)",
+            body="Ограничение максимального радиуса «сферы» при вокселизации (из Bead Area).",
             pros="Убирает выбросы, делает толщину дорожек стабильнее.",
-            cons="Слишком низко → тонкие стенки/ребра могут исчезнуть.",
-            tip="Типичные значения: 1.0–2.5 мм. Если модель ‘разваливается’ — увеличьте.",
+            cons="Слишком низко - тонкие стенки/ребра могут исчезнуть.",
+            tip="Типичные значения: 1.0-2.5 мм. Если модель \"разваливается\" - увеличьте.",
         )
         self.radius_hint = QtWidgets.QLabel("Авто: неизвестно (выберите папку ssys_*)")
         _set_help(
             self.radius_hint,
-            title="Bead radius (auto) status",
+            title="Авто-радиус: статус",
             body="Подсказка, получилось ли определить радиус автоматически.",
-            tip="Выберите папку ssys_* (Slicer job folder), чтобы auto стало доступно.",
+            tip="Выберите папку ssys_* (папка задания слайсера), чтобы авто-режим стал доступен.",
         )
         radius_row = QtWidgets.QHBoxLayout()
         radius_row.addWidget(self.auto_radius)
         radius_row.addWidget(self.max_radius)
         radius_row.addWidget(self.radius_hint, 1)
-        geo_form.addRow("Ограничение радиуса дорожки:", radius_row)
+        geo_adv_form.addRow("Ограничение радиуса дорожки:", radius_row)
 
-        self.estimate = QtWidgets.QLabel("Оценка: —")
+        self.estimate = QtWidgets.QLabel("Оценка: -")
         self.estimate.setWordWrap(True)
         _set_help(
             self.estimate,
-            title="Оценка сетки",
+            title="Оценка нагрузки",
             body="Прикидка размеров воксельной сетки и ожидаемой нагрузки.",
-            tip="Если оценка ‘слишком большая’ — увеличьте Voxel size или ограничьте область/геометрию.",
+            tip="Если оценка \"слишком большая\" - увеличьте Voxel size или ограничьте область/геометрию.",
         )
-        geo_form.addRow("Оценка сетки:", self.estimate)
+        geo_form.addRow("Оценка нагрузки:", self.estimate)
 
         # --- Presets ---
         self._applying_preset = False
         self.preset_combo = QtWidgets.QComboBox()
-        self.preset_combo.addItems(["Custom", "Fast (draft)", "Balanced", "Quality"])
+        self.preset_combo.addItems(["Custom", "Быстро (черновик)", "Баланс", "Качество"])
         self.preset_combo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         self.preset_combo.setMinimumContentsLength(18)
-        self.apply_preset_btn = QtWidgets.QPushButton("Применить")
-        self.apply_preset_btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
-        preset_row = QtWidgets.QHBoxLayout()
-        preset_row.setContentsMargins(0, 0, 0, 0)
-        preset_row.addWidget(self.preset_combo, 1)
-        preset_row.addWidget(self.apply_preset_btn)
-        preset_wrap = QtWidgets.QWidget()
-        preset_wrap.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
-        preset_wrap.setLayout(preset_row)
+        preset_wrap = self.preset_combo
         _set_help(
             self.preset_combo,
             title="Пресеты",
             body="Готовые наборы параметров для быстрого старта.",
             pros="Ускоряет настройку для новичков.",
             cons="Не учитывает все особенности детали/траектории.",
-            tip="Выберите пресет и нажмите Применить. При ручных изменениях режим станет Custom.",
+            tip="Выберите пресет - настройки применятся сразу. При ручных изменениях режим станет Custom.",
         )
-        self.apply_preset_btn.setToolTip("Применить выбранный пресет к параметрам геометрии.")
-        self.apply_preset_btn.setWhatsThis(self.apply_preset_btn.toolTip())
         geo_form.addRow("Пресеты:", preset_wrap)
 
         self.jump_filter = QtWidgets.QCheckBox("Игнорировать перемещения (travel jumps) между траекториями (рекомендуется)")
@@ -2605,110 +3927,163 @@ class MainWindow(QtWidgets.QMainWindow):
             body="Игнорирует длинные перемещения между разорванными траекториями (travel/jump), чтобы не ‘заливать’ материал по воздуху.",
             pros="Убирает ложные перемычки и внутренние ‘нитки’.",
             cons="Если траектория реально разорвана короткими прыжками, можно получить разрывы (редко).",
-            tip="Обычно держите включённым. Если появились неожиданные дырки — попробуйте временно выключить и сравнить.",
+            tip="Обычно держите включённым. Если появились неожиданные дырки - попробуйте временно выключить и сравнить.",
         )
-        geo_form.addRow("Фильтр траектории:", self.jump_filter)
+        geo_adv_form.addRow("Фильтр траектории:", self.jump_filter)
 
         self.min_island = QtWidgets.QSpinBox()
         self.min_island.setRange(0, 10000)
         self.min_island.setValue(150)
+        self.min_island.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.min_island.setFixedWidth(140)
         _set_help(
             self.min_island,
             title="Удаление шума (мин. вокселей)",
             body="Удаляет маленькие компоненты вокселей до построения сетки (3D связность).",
             pros="Убирает ‘мусор’ и ускоряет построение сетки.",
             cons="Слишком большое значение может удалить тонкие элементы.",
-            tip="Начните с 150–300. Если вокруг много мелких точек — увеличьте; если теряются тонкие элементы — уменьшите.",
+            tip="Начните с 150-300. Если вокруг много мелких точек - увеличьте; если теряются тонкие элементы - уменьшите.",
         )
-        geo_form.addRow("Удаление шума (мин. вокселей):", self.min_island)
+        geo_adv_form.addRow("Удаление шума (мин. вокселей):", self.min_island)
 
         self.min_mesh_faces = QtWidgets.QSpinBox()
         self.min_mesh_faces.setRange(0, 50_000_000)
         self.min_mesh_faces.setValue(2000)
+        self.min_mesh_faces.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.min_mesh_faces.setFixedWidth(140)
         _set_help(
             self.min_mesh_faces,
             title="Удаление островков (мин. граней)",
             body="После построения поверхности удаляет куски сетки, у которых меньше указанного числа граней.",
             pros="Убирает мелкие ‘островки’/пылинки вокруг структуры.",
             cons="Слишком большое значение может удалить полезные мелкие детали.",
-            tip="Если много мусора вокруг — увеличьте. Если пропадают нужные мелкие элементы — уменьшите.",
+            tip="Если много мусора вокруг - увеличьте. Если пропадают нужные мелкие элементы - уменьшите.",
         )
-        geo_form.addRow("Удаление островков (мин. граней):", self.min_mesh_faces)
+        geo_adv_form.addRow("Удаление островков (мин. граней):", self.min_mesh_faces)
 
         self.vol_sigma = QtWidgets.QDoubleSpinBox()
         self.vol_sigma.setRange(0.0, 5.0)
         self.vol_sigma.setSingleStep(0.1)
         self.vol_sigma.setValue(0.0)
         self.vol_sigma.setDecimals(2)
+        self.vol_sigma.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.vol_sigma.setFixedWidth(140)
+        self._sigma_rec_label = QtWidgets.QLabel()
+        self._sigma_rec_label.setWordWrap(True)
+        self._sigma_rec_label.setStyleSheet("QLabel { color: #64748B; font-size: 12px; }")
         _set_help(
             self.vol_sigma,
             title="Сглаживание объёма (sigma, vox)",
             body="Гауссово сглаживание воксельного объёма перед marching cubes (sigma в вокселях).",
             pros="Сильно уменьшает “ступеньки/пилу” без большого роста времени.",
             cons="Слишком большое sigma может ‘съесть’ тонкие стенки и сгладить мелкие детали.",
-            tip="Для более гладкой поверхности начните с 1.0. Если тонкие элементы размываются — снизьте до 0.6–0.8.",
+            tip="Для более гладкой поверхности начните с 1.0. Если тонкие элементы размываются - снизьте до 0.6-0.8.",
         )
-        geo_form.addRow("Сглаживание объёма (sigma, vox):", self.vol_sigma)
+        geo_form.addRow("Сглаживание объёма (sigma, vox):", _with_hint(self.vol_sigma, self._sigma_rec_label))
 
         self.meshing_downsample = QtWidgets.QSpinBox()
         self.meshing_downsample.setRange(1, 64)
         self.meshing_downsample.setValue(1)
+        self.meshing_downsample.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.meshing_downsample.setFixedWidth(140)
+        self._downsample_rec_label = QtWidgets.QLabel()
+        self._downsample_rec_label.setWordWrap(True)
+        self._downsample_rec_label.setStyleSheet("QLabel { color: #64748B; font-size: 12px; }")
         _set_help(
             self.meshing_downsample,
-            title="Downsample для meshing (factor)",
-            body="Упрощает сетку ещё на этапе marching cubes: строит поверхность по разреженному объёму (каждый N-й воксель).",
-            pros="Очень сильно уменьшает размер STL и ускоряет meshing (примерно ~N² по числу граней).",
+            title="Разрежение перед построением поверхности (downsample)",
+            body="Строит поверхность по разреженному объёму (каждый N-й воксель) на этапе marching cubes.",
+            pros="Сильно ускоряет построение поверхности и уменьшает размер STL.",
             cons="Тонкие элементы могут исчезнуть; поверхность станет грубее.",
-            tip="Начните с 2 или 4. Если детали теряются — уменьшайте. Если STL слишком большой — увеличивайте.",
+            tip="Начните с 2 или 4. Если детали теряются - уменьшайте. Если STL слишком большой - увеличивайте.",
         )
-        geo_form.addRow("Downsample для meshing:", self.meshing_downsample)
+        geo_form.addRow("Разрежение (downsample):", _with_hint(self.meshing_downsample, self._downsample_rec_label))
 
         self.smooth = QtWidgets.QSpinBox()
         self.smooth.setRange(0, 200)
         self.smooth.setValue(0)
+        self.smooth.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.smooth.setFixedWidth(140)
         _set_help(
             self.smooth,
             title="Сглаживание сетки (итерации)",
             body="Сглаживание уже готовой сетки (Laplacian).",
             pros="Убирает ‘рывки’ и делает поверхность приятнее для последующей постобработки/конвертации в CAD.",
             cons="Может вызывать усадку/замыливание деталей при больших значениях.",
-            tip="10–30 обычно достаточно. Если форма начинает ‘плыть’ — уменьшите.",
+            tip="10-30 обычно достаточно. Если форма начинает \"плыть\" - уменьшите.",
         )
-        geo_form.addRow("Сглаживание сетки (итерации):", self.smooth)
+        geo_adv_form.addRow("Сглаживание сетки (итерации):", self.smooth)
 
         geo_layout.addStretch(1)
 
         # --- Tab: Preview ---
         preview_tab = QtWidgets.QWidget()
         tabs.addTab(preview_tab, "Просмотр")
+        self._preview_tab_index = tabs.indexOf(preview_tab)
         prev_layout = QtWidgets.QVBoxLayout(preview_tab)
+        prev_layout.setContentsMargins(10, 8, 10, 10)
+        prev_layout.setSpacing(10)
         prev_hint = QtWidgets.QLabel(
             "Просмотр результата последнего запуска.\n"
-            "Слева: сетка сразу после marching cubes. Справа: после сглаживания.\n"
+            "Показывает восстановленную геометрию (после сглаживания) и сечение по оси печати (Z+).\n"
             "Если сетка слишком большая, для предпросмотра она автоматически прореживается.\n"
-            "После закрытия программы можно заново загрузить meshes из папки результата."
+            "Также можно включить траекторию слоя (как в слайсере)."
         )
         prev_hint.setWordWrap(True)
+        prev_hint.setStyleSheet(
+            "QLabel { background: #F0FDFA; border: 1px solid #99F6E4; border-radius: 10px; padding: 10px; color: #0F766E; }"
+        )
         prev_layout.addWidget(prev_hint, 0)
         prev_btn_row = QtWidgets.QHBoxLayout()
         prev_layout.addLayout(prev_btn_row)
         self.preview_reload_btn = QtWidgets.QPushButton("Загрузить из папки результата")
-        self.preview_open_after_btn = QtWidgets.QPushButton("Открыть mesh (после)")
-        self.preview_open_before_btn = QtWidgets.QPushButton("Открыть mesh (до)")
         self.preview_open_folder_btn = QtWidgets.QPushButton("Открыть папку результата")
         prev_btn_row.addWidget(self.preview_reload_btn)
         prev_btn_row.addStretch(1)
-        prev_btn_row.addWidget(self.preview_open_before_btn)
-        prev_btn_row.addWidget(self.preview_open_after_btn)
         prev_btn_row.addWidget(self.preview_open_folder_btn)
-        self.mesh_preview = MeshCompareWidget()
-        prev_layout.addWidget(self.mesh_preview, 1)
+
+        # Preview controls: slicer-like Z plane (CMB space, build axis is Z+).
+        controls_row = QtWidgets.QHBoxLayout()
+        prev_layout.addLayout(controls_row, 0)
+        self.preview_slice_cb = QtWidgets.QCheckBox("Сечение по оси печати")
+        self.preview_slice_cb.setChecked(False)
+        self.preview_slice_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.preview_slice_slider.setRange(0, 1000)
+        self.preview_slice_slider.setValue(500)
+        self.preview_slice_slider.setEnabled(False)
+        self.preview_slice_label = QtWidgets.QLabel("Z: -")
+        self.preview_slice_label.setStyleSheet("color: #6B7280;")
+        self.preview_slice_snap_cb = QtWidgets.QCheckBox("Привязка к слоям")
+        self.preview_slice_snap_cb.setChecked(True)
+        self.preview_slice_snap_cb.setToolTip("Если есть ansys_layers.csv, слайдер привязывается к ближайшему слою.")
+        self.preview_toolpath_cb = QtWidgets.QCheckBox("Траектория слоя")
+        self.preview_toolpath_cb.setChecked(False)
+        self.preview_toolpath_cb.setToolTip("Показывает линии траектории (Type=1) как в слайсере.")
+        self.preview_toolpath_range = QtWidgets.QComboBox()
+        self.preview_toolpath_range.addItems(["Один слой", "До слоя", "Все слои"])
+        self.preview_toolpath_range.setCurrentIndex(0)
+        self.preview_toolpath_range.setEnabled(False)
+        self.preview_toolpath_range.setToolTip("Диапазон отображения траекторий: один слой / до слоя / все слои.")
+        controls_row.addWidget(self.preview_slice_cb, 0)
+        controls_row.addWidget(self.preview_slice_slider, 1)
+        controls_row.addWidget(self.preview_slice_label, 0)
+        controls_row.addWidget(self.preview_slice_snap_cb, 0)
+        controls_row.addWidget(self.preview_toolpath_cb, 0)
+        controls_row.addWidget(self.preview_toolpath_range, 0)
+
+        self._preview_mesh_holder = QtWidgets.QWidget()
+        self._preview_mesh_holder_layout = QtWidgets.QVBoxLayout(self._preview_mesh_holder)
+        self._preview_mesh_holder_layout.setContentsMargins(0, 0, 0, 0)
+        prev_layout.addWidget(self._preview_mesh_holder, 1)
+
+        self.mesh_preview = MeshSingleWidget(title="Модель (после сглаживания)")
+        self._preview_mesh_holder_layout.addWidget(self.mesh_preview, 1)
 
         # --- Tab: ANSYS / CAE ---
         ansys_tab = QtWidgets.QWidget()
         tabs.addTab(ansys_tab, "ANSYS / CAE")
         ansys_outer = QtWidgets.QVBoxLayout(ansys_tab)
-        ansys_outer.setContentsMargins(0, 0, 0, 0)
+        ansys_outer.setContentsMargins(10, 8, 10, 10)
 
         ansys_scroll = QtWidgets.QScrollArea()
         ansys_scroll.setWidgetResizable(True)
@@ -2721,17 +4096,36 @@ class MainWindow(QtWidgets.QMainWindow):
         ansys_scroll_content = QtWidgets.QWidget()
         ansys_scroll.setWidget(ansys_scroll_content)
         ansys_layout = QtWidgets.QVBoxLayout(ansys_scroll_content)
-        ansys_layout.setContentsMargins(0, 0, 0, 0)
+        ansys_layout.setContentsMargins(10, 10, 10, 10)
+        ansys_layout.setSpacing(10)
 
         ansys_intro = QtWidgets.QLabel(
             "Режим ANSYS: экспорт ориентации печати по слоям для назначения ортотропии в Mechanical.\n"
-            "Выход: ansys_layers.json/csv + ansys_mechanical_import_layers.py + ansys_mapdl_layers.mac."
+            "Выход: ansys_layers.json/csv + ansys_mechanical_import_layers.py."
         )
         ansys_intro.setWordWrap(True)
+        ansys_intro.setStyleSheet(
+            "QLabel { background: #EEF2FF; border: 1px solid #C7D2FE; border-radius: 10px; padding: 10px; color: #1E3A8A; }"
+        )
         ansys_layout.addWidget(ansys_intro)
+
+        ansys_intro2 = QtWidgets.QLabel(
+            "Важно: slice2solid работает в координатах CMB (Insight) - ось печати всегда Z+ (как в Insight/слайсере).\n"
+            "ANSYS (обычный CAE-режим): импортируйте внешнюю геометрию детали (CAD-solid или обычный STL), "
+            "сгенерируйте mesh, затем запустите `ansys_mechanical_import_layers.py` из папки результата.\n"
+            "Явную структуру `*_s2s_preview_structure.stl` загружайте только если нужно считать реальный инфилл (файл очень тяжёлый)."
+        )
+        ansys_intro2.setWordWrap(True)
+        ansys_intro2.setStyleSheet(
+            "QLabel { background: #F8FAFC; border: 1px solid #E5E7EB; border-radius: 10px; padding: 10px; color: #334155; }"
+        )
+        ansys_layout.addWidget(ansys_intro2)
 
         ansys_group = QtWidgets.QGroupBox("Параметры CAE")
         ansys_form = QtWidgets.QFormLayout(ansys_group)
+        ansys_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+        ansys_form.setHorizontalSpacing(14)
+        ansys_form.setVerticalSpacing(10)
         ansys_layout.addWidget(ansys_group)
 
         self.export_cae = QtWidgets.QCheckBox("Экспортировать карту ориентации слоёв (ANSYS)")
@@ -2741,30 +4135,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- Mechanical script presets/options ---
         self._applying_ansys_preset = False
         self.ansys_preset_combo = QtWidgets.QComboBox()
-        self.ansys_preset_combo.addItems(["Custom", "Detailed (per layer)", "Fast (group 5 layers)", "CS only (group 5)"])
+        self.ansys_preset_combo.addItems(
+            ["Custom", "Подробно (по слоям)", "Быстро (группы по 5 слоёв)", "Только CS (группы по 5)"]
+        )
         self.ansys_preset_combo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         self.ansys_preset_combo.setMinimumContentsLength(22)
-        self.apply_ansys_preset_btn = QtWidgets.QPushButton("Применить")
-        self.apply_ansys_preset_btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
-        ansys_preset_row = QtWidgets.QHBoxLayout()
-        ansys_preset_row.setContentsMargins(0, 0, 0, 0)
-        ansys_preset_row.addWidget(self.ansys_preset_combo, 1)
-        ansys_preset_row.addWidget(self.apply_ansys_preset_btn)
-        ansys_preset_wrap = QtWidgets.QWidget()
-        ansys_preset_wrap.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
-        ansys_preset_wrap.setLayout(ansys_preset_row)
+        ansys_preset_wrap = self.ansys_preset_combo
         _set_help(
             self.ansys_preset_combo,
             title="Пресеты ANSYS",
             body="Наборы настроек для генерируемого Mechanical-скрипта.",
             pros="Ускоряет старт: можно уменьшить число Named Selections/CS за счёт группировки слоёв.",
-            cons="Группировка снижает ‘детальность’ ориентации по высоте.",
-            tip="Выберите пресет и нажмите Применить. При ручных изменениях режим станет Custom.",
+            cons="Группировка снижает 'детальность' ориентации по высоте.",
+            tip="Выберите пресет - настройки применятся сразу. При ручных изменениях режим станет Custom.",
         )
-        self.apply_ansys_preset_btn.setToolTip("Применить выбранный пресет к параметрам Mechanical-скрипта.")
-        self.apply_ansys_preset_btn.setWhatsThis(self.apply_ansys_preset_btn.toolTip())
         ansys_form.addRow("Пресеты:", ansys_preset_wrap)
 
         self.ansys_min_conf = QtWidgets.QDoubleSpinBox()
@@ -2772,42 +4158,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ansys_min_conf.setSingleStep(0.05)
         self.ansys_min_conf.setDecimals(2)
         self.ansys_min_conf.setValue(0.20)
+        self.ansys_min_conf.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.ansys_min_conf.setFixedWidth(140)
         _set_help(
             self.ansys_min_conf,
             title="Min confidence",
             body="Порог ‘confidence’ слоя для создания Coordinate System в Mechanical-скрипте.",
             pros="Отсекает слои с неопределённой/шумной ориентацией.",
-            cons="Слишком высокий порог → больше пропусков CS по высоте.",
-            tip="Обычно 0.15–0.30. Если CS создаются ‘странные’ — поднимите; если CS мало — опустите.",
+            cons="Слишком высокий порог - больше пропусков CS по высоте.",
+            tip="Обычно 0.15-0.30. Если CS создаются \"странные\" - поднимите; если CS мало - опустите.",
         )
-        ansys_form.addRow("Min confidence:", self.ansys_min_conf)
+        ansys_form.addRow("Порог confidence:", self.ansys_min_conf)
 
         self.ansys_group_layers = QtWidgets.QSpinBox()
         self.ansys_group_layers.setRange(1, 200)
         self.ansys_group_layers.setValue(1)
+        self.ansys_group_layers.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.ansys_group_layers.setFixedWidth(140)
         _set_help(
             self.ansys_group_layers,
             title="Group size (layers)",
             body="Сколько слоёв объединять в одну Named Selection/CS в Mechanical-скрипте.",
-            pros="Меньше объектов в дереве Mechanical → быстрее и удобнее.",
+            pros="Меньше объектов в дереве Mechanical - быстрее и удобнее.",
             cons="Потеря детальности ориентации по высоте.",
             tip="1 = по слоям. Для ускорения попробуйте 5 или 10.",
         )
-        ansys_form.addRow("Group size (layers):", self.ansys_group_layers)
+        ansys_form.addRow("Группировка (слоёв):", self.ansys_group_layers)
 
-        self.ansys_create_ns = QtWidgets.QCheckBox("Create Named Selections (mesh elements)")
+        self.ansys_create_ns = QtWidgets.QCheckBox("Создать Named Selections (элементы сетки)")
         self.ansys_create_ns.setChecked(True)
         _set_help(
             self.ansys_create_ns,
             title="Create Named Selections",
             body="Создаёт Named Selection (Mesh Elements) на каждый слой/группу по Z-диапазону.",
             pros="Удобно назначать материалы/постпроцессинг по высоте.",
-            cons="Много слоёв → много объектов (может быть тяжело).",
-            tip="Если Mechanical ‘тяжёлый’ — включите группировку или выключите NS, оставив только CS.",
+            cons="Много слоёв - много объектов (может быть тяжело).",
+            tip="Если Mechanical \"тяжёлый\" - включите группировку или выключите NS, оставив только CS.",
         )
         ansys_form.addRow("Mechanical:", self.ansys_create_ns)
 
-        self.ansys_create_cs = QtWidgets.QCheckBox("Create Coordinate Systems")
+        self.ansys_create_cs = QtWidgets.QCheckBox("Создать Coordinate Systems")
         self.ansys_create_cs.setChecked(True)
         _set_help(
             self.ansys_create_cs,
@@ -2821,10 +4211,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         ansys_hint = QtWidgets.QLabel(
             "ANSYS Mechanical:\n"
-            "1) Импортируйте геометрию, сгенерируйте mesh.\n"
-            "2) Mechanical → Automation → Scripting → Run Script…\n"
-            "3) Для пути A: запустите ansys_mechanical_import_layers.py из папки результата.\n"
-            "   Для пути B (рекомендуется): вставьте ansys_mapdl_layers.mac в Static Structural → Environment → Commands.\n"
+            "1) Импортируйте геометрию детали (обычный CAD-solid/STL в исходных координатах), постройте сетку (Mesh).\n"
+            "   Размещать/поворачивать вручную не нужно: скрипты используют матрицу STL -> CMB из Insight.\n"
+            "2) Mechanical -> Automation -> Scripting -> Run Script...\n"
+            "3) Запустите `CAE/ansys_mechanical_import_layers.py` из папки результата.\n"
+            "   По умолчанию скрипт сам применяет матрицу STL -> CMB (компенсация усадки/ориентация Insight).\n"
+            "   Если ваша модель уже импортирована в CMB - откройте скрипт и установите APPLY_STL_TO_CMB = False.\n"
+            "4) Для визуальной проверки по слоям: запустите `CAE/ansys_mechanical_section_planes.py` и меняйте Z_MM.\n"
         )
         ansys_hint.setWordWrap(True)
         ansys_layout.addWidget(ansys_hint)
@@ -2834,33 +4227,46 @@ class MainWindow(QtWidgets.QMainWindow):
         help_tab = QtWidgets.QWidget()
         tabs.addTab(help_tab, "Справка")
         help_layout = QtWidgets.QVBoxLayout(help_tab)
-        help_btn_row = QtWidgets.QHBoxLayout()
-        self.about_btn = QtWidgets.QPushButton("О программе")
-        self.howto_btn = QtWidgets.QPushButton("Как пользоваться")
-        help_btn_row.addWidget(self.about_btn)
-        help_btn_row.addWidget(self.howto_btn)
-        help_btn_row.addStretch(1)
-        help_layout.addLayout(help_btn_row)
+        help_layout.setContentsMargins(10, 8, 10, 10)
         self.help_view = QtWidgets.QTextBrowser()
         self.help_view.setOpenExternalLinks(True)
         self.help_view.setHtml(_HELP_HTML)
         help_layout.addWidget(self.help_view, 1)
 
-        # --- Run + Outputs (compact bottom panel) ---
+        # --- Run + Outputs (compact bottom panel; collapsible) ---
         bottom_panel = QtWidgets.QWidget()
         bottom_layout = QtWidgets.QVBoxLayout(bottom_panel)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         main_splitter.addWidget(bottom_panel)
+        self._main_splitter = main_splitter
+        self._bottom_tabs: QtWidgets.QTabWidget | None = None
+        self._bottom_collapsed = False
+        self._bottom_last_height = 260
 
+        bottom_header = QtWidgets.QWidget()
+        bottom_header_layout = QtWidgets.QHBoxLayout(bottom_header)
+        bottom_header_layout.setContentsMargins(6, 6, 6, 6)
         self.run_btn = QtWidgets.QPushButton("Запуск")
-        self.run_btn.setMinimumHeight(36)
-        bottom_layout.addWidget(self.run_btn)
-
+        self.run_btn.setObjectName("primaryButton")
+        self.run_btn.setMinimumHeight(32)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
-        bottom_layout.addWidget(self.progress)
+        self.progress.setFixedHeight(18)
+        self.bottom_toggle_btn = QtWidgets.QToolButton()
+        self.bottom_toggle_btn.setText("Свернуть")
+        self.bottom_toggle_btn.setCheckable(True)
+        self.bottom_toggle_btn.setChecked(False)
+        self.bottom_toggle_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.bottom_toggle_btn.setArrowType(QtCore.Qt.ArrowType.DownArrow)
+        bottom_header_layout.addWidget(self.run_btn, 0)
+        bottom_header_layout.addSpacing(10)
+        bottom_header_layout.addWidget(self.progress, 1)
+        bottom_header_layout.addSpacing(10)
+        bottom_header_layout.addWidget(self.bottom_toggle_btn, 0)
+        bottom_layout.addWidget(bottom_header, 0)
 
         bottom_tabs = QtWidgets.QTabWidget()
+        self._bottom_tabs = bottom_tabs
         bottom_layout.addWidget(bottom_tabs, 1)
 
         results_tab = QtWidgets.QWidget()
@@ -2893,24 +4299,34 @@ class MainWindow(QtWidgets.QMainWindow):
         # Prefer the upper area visually; keep bottom compact but resizable by dragging the splitter.
         main_splitter.setStretchFactor(0, 5)
         main_splitter.setStretchFactor(1, 1)
-        main_splitter.setSizes([1000, 260])
+        main_splitter.setSizes([1000, 220])
+        self._bottom_last_height = 220
 
         self.thread: QtCore.QThread | None = None
         self.worker: Worker | None = None
         self._last_outputs: list[str] = []
-        self._preview_before_path: str | None = None
-        self._preview_after_path: str | None = None
-        self._settings = QtCore.QSettings()
+        self._preview_zmin: float | None = None
+        self._preview_zmax: float | None = None
+        self._preview_layer_z: list[float] | None = None
+        self._preview_sim_path: str | None = None
+        self._preview_slice_height_mm: float | None = None
+        # Cache: (mode, layer_id) -> (range_segments, layer_segments)
+        self._preview_toolpath_cache: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] = {}
+        self._preview_toolpath_last_key: tuple[str, int] | None = None
+        # CMB-only: build axis is always Z+.
+        self._preview_last_after: trimesh.Trimesh | None = None
+        self._preview_last_stats: dict | None = None
 
-        self.sim_btn.clicked.connect(self._pick_sim)
         self.job_btn.clicked.connect(self._pick_job)
-        self.stl_btn.clicked.connect(self._pick_stl)
         self.out_btn.clicked.connect(self._pick_out)
+        self.advanced_toggle.toggled.connect(self._on_advanced_toggled)
+        self.geo_advanced_toggle.toggled.connect(self._on_geo_advanced_toggled)
         self.run_btn.clicked.connect(self._run)
+        self.bottom_toggle_btn.toggled.connect(self._on_bottom_toggle)
+        self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
         self.auto_radius.toggled.connect(self._update_radius_widgets)
-        self.sim_edit.textChanged.connect(self._recompute_auto_radius)
         self.job_edit.textChanged.connect(self._recompute_auto_radius)
-        self.stl_edit.textChanged.connect(self._recompute_estimate)
+        self.job_edit.textChanged.connect(self._recompute_estimate)
         self.voxel_size.valueChanged.connect(self._recompute_estimate)
         self.jump_filter.toggled.connect(self._recompute_estimate)
         self.min_island.valueChanged.connect(self._recompute_estimate)
@@ -2927,16 +4343,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.outputs_list.itemDoubleClicked.connect(self._open_selected_output)
         self.open_selected_btn.clicked.connect(self._open_selected_output)
         self.copy_selected_btn.clicked.connect(self._copy_selected_output_path)
-        self.apply_preset_btn.clicked.connect(self._apply_selected_preset)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_selection_changed)
-        self.apply_ansys_preset_btn.clicked.connect(self._apply_selected_ansys_preset)
-        self.about_btn.clicked.connect(self._show_about)
-        self.howto_btn.clicked.connect(self._show_help)
+        self.ansys_preset_combo.currentIndexChanged.connect(self._on_ansys_preset_selection_changed)
         self.preview_open_folder_btn.clicked.connect(self._open_output_folder)
         self.preview_reload_btn.clicked.connect(lambda: self._load_last_run_from_output_dir(load_meshes=True))
-        self.preview_open_after_btn.clicked.connect(self._open_preview_after)
-        self.preview_open_before_btn.clicked.connect(self._open_preview_before)
         self.out_edit.editingFinished.connect(lambda: self._load_last_run_from_output_dir(load_meshes=False))
+        self.preview_slice_cb.toggled.connect(self._on_preview_slice_toggled)
+        self.preview_slice_slider.valueChanged.connect(self._on_preview_slice_changed)
+        self.preview_slice_snap_cb.toggled.connect(self._on_preview_slice_changed)
+        self.preview_toolpath_cb.toggled.connect(self._on_preview_toolpath_toggled)
+        self.preview_toolpath_range.currentIndexChanged.connect(self._on_preview_slice_changed)
 
         # If user edits any parameter manually -> switch preset to Custom.
         for w in (
@@ -2961,9 +4377,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in (self.ansys_min_conf, self.ansys_group_layers, self.ansys_create_ns, self.ansys_create_cs):
             self._connect_any_change(w, self._mark_ansys_preset_custom)
 
+        self._update_cad_recommendations()
+
         self._restore_settings()
         self._update_step_widgets()
-        self._update_preview_buttons()
 
     def ensure_visible_on_screen(self) -> None:
         try:
@@ -3002,9 +4419,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self._settings.setValue("window/geometry", self.saveGeometry())
             self._settings.setValue("window/state", self.saveState())
-            self._settings.setValue("paths/sim", self.sim_edit.text().strip())
             self._settings.setValue("paths/job", self.job_edit.text().strip())
-            self._settings.setValue("paths/stl", self.stl_edit.text().strip())
             self._settings.setValue("paths/out", self.out_edit.text().strip())
         except Exception:
             pass
@@ -3019,40 +4434,181 @@ class MainWindow(QtWidgets.QMainWindow):
             if isinstance(state, QtCore.QByteArray):
                 self.restoreState(state)
 
-            sim = self._settings.value("paths/sim", "", type=str) or ""
             job = self._settings.value("paths/job", "", type=str) or ""
-            stl = self._settings.value("paths/stl", "", type=str) or ""
             out = self._settings.value("paths/out", "", type=str) or ""
 
-            if sim and not self.sim_edit.text().strip():
-                self.sim_edit.setText(sim)
             if job and not self.job_edit.text().strip():
                 self.job_edit.setText(job)
-            if stl and not self.stl_edit.text().strip():
-                self.stl_edit.setText(stl)
             if out and not self.out_edit.text().strip():
                 self.out_edit.setText(out)
         except Exception:
             return
         self._load_last_run_from_output_dir(load_meshes=False)
 
-    def _update_preview_buttons(self) -> None:
-        self.preview_open_before_btn.setEnabled(bool(self._preview_before_path))
-        self.preview_open_after_btn.setEnabled(bool(self._preview_after_path))
+    # Preview backend switching removed: keep a single CMB-oriented preview (Auto => prefer VTK).
 
-    def _open_preview_after(self) -> None:
-        if not self._preview_after_path:
-            return
+    def _update_preview_slider_enabled(self) -> None:
+        enabled = bool(self.preview_slice_cb.isChecked()) or bool(self.preview_toolpath_cb.isChecked())
         try:
-            os.startfile(self._preview_after_path)  # type: ignore[attr-defined]
+            self.preview_slice_slider.setEnabled(enabled)
         except Exception:
             pass
 
-    def _open_preview_before(self) -> None:
-        if not self._preview_before_path:
+    def _on_preview_slice_toggled(self, on: bool) -> None:
+        self._update_preview_slider_enabled()
+        self._apply_preview_slice()
+
+    def _on_preview_toolpath_toggled(self, on: bool) -> None:
+        try:
+            self.preview_toolpath_range.setEnabled(bool(on))
+        except Exception:
+            pass
+        self._update_preview_slider_enabled()
+        self._apply_preview_slice()
+
+    def _on_preview_slice_changed(self, *_args: object) -> None:
+        self._apply_preview_slice()
+
+    def _update_preview_slice_label(self) -> None:
+        if not (bool(self.preview_slice_cb.isChecked()) or bool(self.preview_toolpath_cb.isChecked())):
+            self.preview_slice_label.setText("Z: -")
+            return
+        if self._preview_zmin is None or self._preview_zmax is None:
+            self.preview_slice_label.setText("Z: -")
+            return
+        z = self._preview_slice_z_mm()
+        self.preview_slice_label.setText(f"Z: {z:.3f}")
+
+    def _preview_slice_z_mm(self) -> float:
+        z0 = float(self._preview_zmin or 0.0)
+        z1 = float(self._preview_zmax or z0)
+        t = float(self.preview_slice_slider.value()) / 1000.0
+        z = z0 + t * (z1 - z0)
+        if bool(self.preview_slice_snap_cb.isChecked()) and self._preview_layer_z:
+            # Snap to closest layer center when available.
+            try:
+                arr = np.asarray(self._preview_layer_z, dtype=float)
+                idx = int(np.argmin(np.abs(arr - z)))
+                z = float(arr[idx])
+            except Exception:
+                pass
+        return float(z)
+
+    def _apply_preview_slice(self) -> None:
+        self._update_preview_slice_label()
+        enabled = bool(self.preview_slice_cb.isChecked())
+        z = self._preview_slice_z_mm()
+        try:
+            self.mesh_preview.set_slice_z(enabled=enabled, z_mm=z)
+        except Exception:
+            pass
+        # Fallback for older view types: use normalized t.
+        try:
+            self.mesh_preview.set_slice(enabled=enabled, t=float(self.preview_slice_slider.value()) / 1000.0)
+        except Exception:
+            pass
+
+        self._apply_preview_toolpath(z_mm=z)
+
+    def _apply_preview_toolpath(self, *, z_mm: float) -> None:
+        if not hasattr(self, "preview_toolpath_cb"):
+            return
+        if not bool(self.preview_toolpath_cb.isChecked()):
+            try:
+                self.mesh_preview.set_toolpath_layers(range_segments=None, layer_segments=None)
+            except Exception:
+                pass
+            self._preview_toolpath_last_key = None
+            return
+        if not self._preview_sim_path or not Path(self._preview_sim_path).exists():
+            return
+        if self._preview_slice_height_mm is None or float(self._preview_slice_height_mm) <= 0:
+            return
+
+        z0 = float(self._preview_zmin or 0.0)
+        slice_h = float(self._preview_slice_height_mm)
+        layer_id = int(round((float(z_mm) - z0) / slice_h))
+        layer_id = max(0, layer_id)
+        mode_idx = 0
+        try:
+            mode_idx = int(self.preview_toolpath_range.currentIndex())
+        except Exception:
+            mode_idx = 0
+        mode = "layer" if mode_idx == 0 else ("upto" if mode_idx == 1 else "all")
+
+        # max jump for "travel jump" filtering
+        max_jump = None
+        try:
+            max_jump = float(self._last_max_jump_mm) if hasattr(self, "_last_max_jump_mm") else None
+        except Exception:
+            max_jump = None
+
+        # Layer-only cache (used by all modes to draw current layer in red).
+        layer_key = ("layer", int(layer_id))
+        if layer_key not in self._preview_toolpath_cache:
+            try:
+                seg_layer = extract_toolpath_segments_for_layer(
+                    self._preview_sim_path,
+                    z_center_mm=float(z_mm),
+                    slice_height_mm=slice_h,
+                    max_jump_mm=max_jump,
+                    max_segments=250_000,
+                )
+                self._preview_toolpath_cache[layer_key] = (np.zeros((0, 2, 3), dtype=np.float32), seg_layer)
+            except Exception:
+                return
+
+        range_seg = None
+        layer_seg = self._preview_toolpath_cache[layer_key][1]
+
+        if mode == "layer":
+            range_seg = None
+            apply_key = layer_key
+        elif mode == "upto":
+            upto_key = ("upto", int(layer_id))
+            if upto_key not in self._preview_toolpath_cache:
+                try:
+                    seg_range, seg_cur = extract_toolpath_segments_for_range(
+                        self._preview_sim_path,
+                        z0_mm=z0,
+                        slice_height_mm=slice_h,
+                        max_layer_id_inclusive=int(layer_id),
+                        max_jump_mm=max_jump,
+                        max_segments=600_000,
+                    )
+                    self._preview_toolpath_cache[upto_key] = (seg_range, seg_cur)
+                except Exception:
+                    return
+            range_seg = self._preview_toolpath_cache[upto_key][0]
+            layer_seg = self._preview_toolpath_cache[upto_key][1]
+            apply_key = upto_key
+        else:
+            all_key = ("all", 0)
+            if all_key not in self._preview_toolpath_cache:
+                try:
+                    seg_range, _seg_cur = extract_toolpath_segments_for_range(
+                        self._preview_sim_path,
+                        z0_mm=z0,
+                        slice_height_mm=slice_h,
+                        max_layer_id_inclusive=None,
+                        max_jump_mm=max_jump,
+                        max_segments=1_200_000,
+                    )
+                    self._preview_toolpath_cache[all_key] = (seg_range, np.zeros((0, 2, 3), dtype=np.float32))
+                except Exception:
+                    return
+            range_seg = self._preview_toolpath_cache[all_key][0]
+            # current layer still highlighted in red
+            layer_seg = self._preview_toolpath_cache[layer_key][1]
+            # Track the current layer to refresh the red highlight when the slider moves.
+            apply_key = ("all", int(layer_id))
+
+        if self._preview_toolpath_last_key == apply_key:
+            # Avoid excessive re-rendering when slider sends repeated events.
             return
         try:
-            os.startfile(self._preview_before_path)  # type: ignore[attr-defined]
+            self.mesh_preview.set_toolpath_layers(range_segments=range_seg, layer_segments=layer_seg)
+            self._preview_toolpath_last_key = apply_key
         except Exception:
             pass
 
@@ -3069,6 +4625,31 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             return
 
+        # Toolpath overlay inputs.
+        try:
+            inputs = meta.get("inputs") if isinstance(meta, dict) else None
+            if isinstance(inputs, dict):
+                sp = inputs.get("simulation_txt")
+                self._preview_sim_path = str(sp) if isinstance(sp, str) and sp else None
+            else:
+                self._preview_sim_path = None
+        except Exception:
+            self._preview_sim_path = None
+
+        try:
+            sh = None
+            if isinstance(meta.get("simulation_header"), dict):
+                sh = meta["simulation_header"].get("Slice height")
+            self._preview_slice_height_mm = float(sh) if sh is not None and str(sh).strip() else None
+        except Exception:
+            self._preview_slice_height_mm = None
+
+        try:
+            self._preview_toolpath_cache.clear()
+            self._preview_toolpath_last_key = None
+        except Exception:
+            pass
+
         outputs = meta.get("outputs")
         if isinstance(outputs, list):
             try:
@@ -3076,14 +4657,11 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        before_path = None
         after_path = None
         if isinstance(outputs, list):
             for x in outputs:
                 p = str(x)
                 pl = p.lower()
-                if pl.endswith("_mesh_before.ply") or pl.endswith("_before.ply"):
-                    before_path = p
                 if pl.endswith("_mesh.ply") and "_s2s_preview_structure" in pl:
                     after_path = p
                 if pl.endswith(".ply") and "_before" not in pl and "_s2s_preview_structure" in pl and after_path is None:
@@ -3093,60 +4671,101 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if after_path is None:
             candidates = sorted(
-                out_dir.glob("*_s2s_preview_structure*_mesh.ply"), key=lambda p: p.stat().st_mtime, reverse=True
+                (out_dir / "CAD").glob("*_s2s_preview_structure*_mesh.ply"), key=lambda p: p.stat().st_mtime, reverse=True
             )
             if candidates:
                 after_path = str(candidates[0])
         if after_path is None:
             # Backward compatibility: older runs used `{stem}.ply`.
-            candidates = sorted(out_dir.glob("*_s2s_preview_structure*.ply"), key=lambda p: p.stat().st_mtime, reverse=True)
+            candidates = sorted((out_dir / "CAD").glob("*_s2s_preview_structure*.ply"), key=lambda p: p.stat().st_mtime, reverse=True)
             if candidates:
                 after_path = str(candidates[0])
-        if before_path is None:
-            candidates = sorted(
-                out_dir.glob("*_s2s_preview_structure*_mesh_before.ply"), key=lambda p: p.stat().st_mtime, reverse=True
-            )
-            if candidates:
-                before_path = str(candidates[0])
-        if before_path is None:
-            # Backward compatibility: older runs used `{stem}_before.ply`.
-            candidates = sorted(out_dir.glob("*_s2s_preview_structure*_before.ply"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if candidates:
-                before_path = str(candidates[0])
 
-        self._preview_before_path = before_path
-        self._preview_after_path = after_path
-        self._update_preview_buttons()
+        # Keep these paths local: opening meshes is done via the Results list.
+
+        # Preferred slicing build-height range: from ansys_layers.csv if present (aligns with CAE layers).
+        self._preview_layer_z = None
+        self._preview_zmin = None
+        self._preview_zmax = None
+        try:
+            layers_csv = (out_dir / "CAE") / "ansys_layers.csv"
+            if layers_csv.exists():
+                txt = layers_csv.read_text(encoding="utf-8", errors="replace").splitlines()
+                if len(txt) >= 2:
+                    header = [h.strip() for h in txt[0].split(",")]
+                    idx = {h: i for i, h in enumerate(header)}
+                    zmin_i = idx.get("z_min_mm")
+                    zmax_i = idx.get("z_max_mm")
+                    if zmin_i is not None and zmax_i is not None:
+                        zmins = []
+                        zmaxs = []
+                        zc = []
+                        for line in txt[1:]:
+                            parts = [p.strip() for p in line.split(",")]
+                            if len(parts) <= max(zmin_i, zmax_i):
+                                continue
+                            try:
+                                zmin = float(parts[zmin_i])
+                                zmax = float(parts[zmax_i])
+                            except Exception:
+                                continue
+                            zmins.append(zmin)
+                            zmaxs.append(zmax)
+                            zc.append(0.5 * (zmin + zmax))
+                        if zmins and zmaxs:
+                            self._preview_zmin = float(min(zmins))
+                            self._preview_zmax = float(max(zmaxs))
+                            self._preview_layer_z = sorted(float(x) for x in zc)
+        except Exception:
+            self._preview_layer_z = None
 
         if not load_meshes or after_path is None:
+            # Fallback slicing range: from last in-memory mesh bounds (if available).
+            if self._preview_zmin is None or self._preview_zmax is None:
+                try:
+                    if isinstance(self._preview_last_after, trimesh.Trimesh):
+                        bb = np.asarray(self._preview_last_after.bounds, dtype=float)
+                        self._preview_zmin = float(bb[0, 2])
+                        self._preview_zmax = float(bb[1, 2])
+                except Exception:
+                    self._preview_zmin = None
+                    self._preview_zmax = None
+            self._apply_preview_slice()
             return
+
         try:
             after_mesh = trimesh.load_mesh(after_path, force="mesh")
         except Exception:
             return
-        before_mesh = None
-        if before_path is not None:
-            try:
-                before_mesh = trimesh.load_mesh(before_path, force="mesh")
-            except Exception:
-                before_mesh = None
-        if before_mesh is None:
-            before_mesh = after_mesh
 
-        stats = {
-            "before": {"vertices": int(before_mesh.vertices.shape[0]), "faces": int(before_mesh.faces.shape[0])},
-            "after": {"vertices": int(after_mesh.vertices.shape[0]), "faces": int(after_mesh.faces.shape[0])},
-        }
+        # Fallback slicing Z-range: from mesh bounds.
+        if self._preview_zmin is None or self._preview_zmax is None:
+            try:
+                bb = np.asarray(after_mesh.bounds, dtype=float)
+                self._preview_zmin = float(bb[0, 2])
+                self._preview_zmax = float(bb[1, 2])
+            except Exception:
+                self._preview_zmin = None
+                self._preview_zmax = None
+
+        stats = {"after": {"vertices": int(after_mesh.vertices.shape[0]), "faces": int(after_mesh.faces.shape[0])}}
+
+        # Some preview backends (notably Qt OpenGL) can silently fail to render multi-million-face meshes.
+        # Use a lightweight deterministic face subsample for interactive preview while keeping original files intact.
         try:
-            self.mesh_preview.set_meshes(before_mesh, after_mesh, stats)
+            target_faces = 600_000
+            disp_after = _build_lightweight_display_mesh(after_mesh, target_faces=target_faces)
+            stats["display_after"] = {"vertices": int(disp_after.vertices.shape[0]), "faces": int(disp_after.faces.shape[0]), "ds": 1}
+            after_mesh = disp_after
         except Exception:
             pass
-
-    def _pick_sim(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Выберите экспорт симуляции", "", "Text (*.txt)")
-        if path:
-            self.sim_edit.setText(path)
-            self._auto_fill_from_sim(path)
+        try:
+            self.mesh_preview.set_mesh(after_mesh, stats=stats, key="after")
+        except Exception:
+            pass
+        self._preview_last_after = after_mesh
+        self._preview_last_stats = stats
+        self._apply_preview_slice()
 
     def _connect_any_change(self, widget: QtWidgets.QWidget, cb) -> None:
         # Best-effort connections for common widget types.
@@ -3174,6 +4793,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self.preset_combo.currentText() != "Custom":
             self.preset_combo.setCurrentText("Custom")
+        self._update_cad_recommendations()
 
     def _mark_ansys_preset_custom(self, *_args: object) -> None:
         if getattr(self, "_applying_ansys_preset", False):
@@ -3181,9 +4801,63 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.ansys_preset_combo.currentText() != "Custom":
             self.ansys_preset_combo.setCurrentText("Custom")
 
+    def _update_cad_recommendations(self) -> None:
+        def _set(label: QtWidgets.QLabel | None, text: str, *, tone: str = "muted") -> None:
+            if label is None:
+                return
+            label.setText(text)
+            if tone == "ok":
+                label.setStyleSheet("QLabel { color: #0F766E; font-size: 12px; }")
+            elif tone == "warn":
+                label.setStyleSheet("QLabel { color: #B45309; font-size: 12px; }")
+            else:
+                label.setStyleSheet("QLabel { color: #64748B; font-size: 12px; }")
+
+        preset = ""
+        try:
+            preset = str(self.preset_combo.currentText()).strip()
+        except Exception:
+            preset = ""
+
+        rec_map = {
+            "Быстро (черновик)": dict(voxel=0.25, sigma=0.0, downsample=4),
+            "Баланс": dict(voxel=0.10, sigma=1.0, downsample=2),
+            "Качество": dict(voxel=0.05, sigma=1.0, downsample=1),
+            # legacy/compat keys
+            "Fast (draft)": dict(voxel=0.25, sigma=0.0, downsample=4),
+            "Balanced": dict(voxel=0.10, sigma=1.0, downsample=2),
+            "Quality": dict(voxel=0.05, sigma=1.0, downsample=1),
+        }
+
+        if preset in rec_map:
+            r = rec_map[preset]
+            v = float(getattr(self.voxel_size, "value")())
+            s = float(getattr(self.vol_sigma, "value")())
+            d = int(getattr(self.meshing_downsample, "value")())
+
+            tol_v = 1e-6
+            ok_v = abs(v - float(r["voxel"])) <= tol_v
+            ok_s = abs(s - float(r["sigma"])) <= 1e-6
+            ok_d = int(d) == int(r["downsample"])
+
+            _set(self._voxel_rec_label, f"Реком. для пресета: {r['voxel']:.2f} мм", tone="ok" if ok_v else "warn")
+            _set(self._sigma_rec_label, f"Реком. для пресета: {r['sigma']:.1f}", tone="ok" if ok_s else "warn")
+            _set(self._downsample_rec_label, f"Реком. для пресета: {int(r['downsample'])}", tone="ok" if ok_d else "warn")
+            return
+
+        # Custom / no preset selected: show general guidance.
+        _set(self._voxel_rec_label, "Реком.: 0.25 (быстро) / 0.10 (баланс) / 0.05 (качество)", tone="muted")
+        _set(self._sigma_rec_label, "Реком.: 0.6-1.0 (для сглаживания); 0.0 если важны тонкие элементы", tone="muted")
+        _set(self._downsample_rec_label, "Реком.: 2-4 (если STL слишком большой/медленно)", tone="muted")
+
     def _on_preset_selection_changed(self, *_args: object) -> None:
-        # Do not auto-apply on selection to avoid surprising changes; user clicks Apply.
-        pass
+        self._update_cad_recommendations()
+        # Apply immediately to keep the UI simple (no extra "Apply" button).
+        try:
+            if self.preset_combo.currentText() != "Custom":
+                self._apply_selected_preset()
+        except Exception:
+            pass
 
     def _apply_selected_preset(self) -> None:
         preset = self.preset_combo.currentText()
@@ -3193,6 +4867,7 @@ class MainWindow(QtWidgets.QMainWindow):
         presets = {
             "Fast (draft)": dict(
                 voxel_size_mm=0.25,
+                meshing_downsample_factor=4,
                 volume_smooth_sigma_vox=0.0,
                 smooth_iterations=0,
                 min_component_voxels=150,
@@ -3200,6 +4875,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
             "Balanced": dict(
                 voxel_size_mm=0.10,
+                meshing_downsample_factor=2,
                 volume_smooth_sigma_vox=1.0,
                 smooth_iterations=15,
                 min_component_voxels=150,
@@ -3207,6 +4883,32 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
             "Quality": dict(
                 voxel_size_mm=0.05,
+                meshing_downsample_factor=1,
+                volume_smooth_sigma_vox=1.0,
+                smooth_iterations=25,
+                min_component_voxels=150,
+                min_mesh_component_faces=2000,
+            ),
+            # RU aliases (current UI)
+            "Быстро (черновик)": dict(
+                voxel_size_mm=0.25,
+                meshing_downsample_factor=4,
+                volume_smooth_sigma_vox=0.0,
+                smooth_iterations=0,
+                min_component_voxels=150,
+                min_mesh_component_faces=2000,
+            ),
+            "Баланс": dict(
+                voxel_size_mm=0.10,
+                meshing_downsample_factor=2,
+                volume_smooth_sigma_vox=1.0,
+                smooth_iterations=15,
+                min_component_voxels=150,
+                min_mesh_component_faces=2000,
+            ),
+            "Качество": dict(
+                voxel_size_mm=0.05,
+                meshing_downsample_factor=1,
                 volume_smooth_sigma_vox=1.0,
                 smooth_iterations=25,
                 min_component_voxels=150,
@@ -3220,6 +4922,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._applying_preset = True
         try:
             self.voxel_size.setValue(float(cfg["voxel_size_mm"]))
+            self.meshing_downsample.setValue(int(cfg.get("meshing_downsample_factor", int(self.meshing_downsample.value()))))
             self.vol_sigma.setValue(float(cfg["volume_smooth_sigma_vox"]))
             self.smooth.setValue(int(cfg["smooth_iterations"]))
             self.min_island.setValue(int(cfg["min_component_voxels"]))
@@ -3228,6 +4931,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._applying_preset = False
 
         self._recompute_estimate()
+        self._update_cad_recommendations()
 
     def _apply_selected_ansys_preset(self) -> None:
         preset = self.ansys_preset_combo.currentText()
@@ -3238,6 +4942,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "Detailed (per layer)": dict(group_size_layers=1, min_conf=0.2, create_ns=True, create_cs=True),
             "Fast (group 5 layers)": dict(group_size_layers=5, min_conf=0.2, create_ns=True, create_cs=True),
             "CS only (group 5)": dict(group_size_layers=5, min_conf=0.2, create_ns=False, create_cs=True),
+            # RU aliases (current UI)
+            "Подробно (по слоям)": dict(group_size_layers=1, min_conf=0.2, create_ns=True, create_cs=True),
+            "Быстро (группы по 5 слоёв)": dict(group_size_layers=5, min_conf=0.2, create_ns=True, create_cs=True),
+            "Только CS (группы по 5)": dict(group_size_layers=5, min_conf=0.2, create_ns=False, create_cs=True),
         }
         cfg = presets.get(preset)
         if not cfg:
@@ -3251,21 +4959,89 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ansys_create_cs.setChecked(bool(cfg["create_cs"]))
         finally:
             self._applying_ansys_preset = False
+
+    def _on_ansys_preset_selection_changed(self, *_args: object) -> None:
+        # Apply immediately to keep the UI simple (no extra "Apply" button).
+        try:
+            if self.ansys_preset_combo.currentText() != "Custom":
+                self._apply_selected_ansys_preset()
+        except Exception:
+            pass
     def _pick_job(self) -> None:
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку задания ssys_*")
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку после слайсинга (ssys_*)")
         if path:
             self.job_edit.setText(path)
             self._auto_fill_from_job(path)
-
-    def _pick_stl(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Выберите placed STL", "", "STL (*.stl *.STL)")
-        if path:
-            self.stl_edit.setText(path)
 
     def _pick_out(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку результата")
         if path:
             self.out_edit.setText(path)
+
+    def _on_advanced_toggled(self, checked: bool) -> None:
+        try:
+            self.advanced_panel.setVisible(bool(checked))
+        except Exception:
+            pass
+        try:
+            self.advanced_toggle.setArrowType(QtCore.Qt.ArrowType.DownArrow if checked else QtCore.Qt.ArrowType.RightArrow)
+        except Exception:
+            pass
+
+    def _on_geo_advanced_toggled(self, checked: bool) -> None:
+        checked = bool(checked)
+        try:
+            self.geo_advanced_panel.setVisible(checked)
+        except Exception:
+            pass
+        try:
+            self.geo_advanced_toggle.setArrowType(
+                QtCore.Qt.ArrowType.DownArrow if checked else QtCore.Qt.ArrowType.RightArrow
+            )
+        except Exception:
+            pass
+
+    def _set_bottom_collapsed(self, collapsed: bool) -> None:
+        collapsed = bool(collapsed)
+        if getattr(self, "_bottom_collapsed", False) == collapsed:
+            return
+        self._bottom_collapsed = collapsed
+        try:
+            if self._bottom_tabs is not None:
+                self._bottom_tabs.setVisible(not collapsed)
+        except Exception:
+            pass
+        try:
+            self.bottom_toggle_btn.setText("Развернуть" if collapsed else "Свернуть")
+            self.bottom_toggle_btn.setArrowType(QtCore.Qt.ArrowType.RightArrow if collapsed else QtCore.Qt.ArrowType.DownArrow)
+        except Exception:
+            pass
+        try:
+            if self._main_splitter is not None:
+                sizes = list(self._main_splitter.sizes())
+                if len(sizes) >= 2:
+                    if not collapsed:
+                        sizes[1] = int(getattr(self, "_bottom_last_height", 220) or 220)
+                    else:
+                        # Keep a thin strip for Run + progress.
+                        self._bottom_last_height = int(sizes[1])
+                        sizes[1] = 54
+                    # Increase top accordingly.
+                    sizes[0] = max(200, int(sizes[0]) + int(sizes[1]))
+                    self._main_splitter.setSizes(sizes[:2])
+        except Exception:
+            pass
+
+    def _on_bottom_toggle(self, checked: bool) -> None:
+        self._set_bottom_collapsed(bool(checked))
+
+    def _on_main_tab_changed(self, idx: int) -> None:
+        # Auto-collapse bottom panel on Preview tab to maximize the graphics area.
+        try:
+            if hasattr(self, "_preview_tab_index") and int(idx) == int(self._preview_tab_index):
+                self._set_bottom_collapsed(True)
+        except Exception:
+            pass
 
     def _append_log(self, msg: str) -> None:
         self.log_box.appendPlainText(msg)
@@ -3313,22 +5089,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _show_help(self) -> None:
         msg = (
-            "1) Выберите Simulation export (*.txt):\n"
-            "   Insight -> Toolpaths -> Simulation data export.\n\n"
-            "2) Выберите Slicer job folder (ssys_*):\n"
-            "   Нужен для авто-определения ширины дорожки / bead radius.\n\n"
-            "3) Выберите Placed STL (*.stl):\n"
-            "   STL после размещения на столе (placed).\n\n"
-            "4) Выберите папку результата и нажмите Запуск.\n\n"
+            "1) Выберите папку после слайсинга (ssys_*).\n"
+            "   Внутри должен быть `*-simulation-data.txt` (Insight: Toolpaths -> Simulation data export).\n\n"
+            "2) Для восстановления геометрии нужен `*.stl` в этой же папке.\n"
+            "   Если STL не находится: включите в Insight сохранение копии STL в папку задания (Save STL copy / Save STL in job folder)\n"
+            "   или скопируйте исходный STL в папку ssys_* вручную.\n\n"
+            "3) Нажмите Запуск. По умолчанию результаты пишутся в `<ssys_*>/slice2solid_out` (override — в «Дополнительно»).\n\n"
             "После запуска:\n"
-            " - вкладка 'Просмотр' показывает сетку до/после сглаживания\n"
+            " - вкладка 'Просмотр' показывает модель (после сглаживания), сечение по Z и траекторию слоёв\n"
             " - блок 'Результаты' позволяет открыть файлы/папку и скопировать путь\n\n"
             "Основные выходные файлы:\n"
-            " - Для CAE (ANSYS): обычно берут геометрию детали (placed STL или CAD-solid) + ansys_layers.*\n"
-            " - *_s2s_preview_structure.stl (если включён экспорт геометрии)\n"
-            " - metadata.json (параметры/матрица/статистика)\n"
-            " - ansys_layers.json/csv + ansys_mechanical_import_layers.py + ansys_mapdl_layers.mac (если включён экспорт ANSYS)\n"
-            " - *_s2s_preview_structure_mesh.ply, voxel_points.csv, cad_import_notes.txt (если включён CAD bundle)\n\n"
+            " - `metadata.json` (параметры/матрица/статистика)\n"
+            " - `CAD/*_s2s_preview_structure.stl` (явная геометрия инфилла — тяжёлая)\n"
+            " - `CAD/*_s2s_preview_structure_mesh.ply`, `CAD/voxel_points.csv`, `CAD/cad_import_notes.txt` (опционально)\n"
+            " - `CAE/ansys_layers.json`, `CAE/ansys_layers.csv` + `CAE/ansys_mechanical_import_layers.py`\n"
+            " - `CAE/ansys_mechanical_section_planes.py` (визуальная проверка слоёв в Mechanical)\n\n"
             " - *_healed.stl (+ *_healed_report.json), если включён Mesh Healer (CAD)\n\n"
             "Подробности: вкладка 'Справка' и docs/cad_import_guide_ru.md."
         )
@@ -3343,34 +5118,20 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def _auto_fill_from_sim(self, sim_path: str) -> None:
-        p = Path(sim_path)
+    def _auto_fill_from_job(self, job_dir: str) -> None:
         # auto output folder
         if not self.out_edit.text().strip():
-            self.out_edit.setText(str(p.parent / "slice2solid_out"))
-
-        # try infer ssys_* folder from proximity
-        if not self.job_edit.text().strip():
-            candidates: list[Path] = []
-            for base in [p.parent, p.parent.parent]:
-                if base is None or not base.exists():
-                    continue
-                for d in base.iterdir():
-                    if d.is_dir() and d.name.lower().startswith("ssys_"):
-                        if (d / "toolpathParams.cur").exists() or (d / "toolpathParams.new").exists():
-                            candidates.append(d)
-            if candidates:
-                self.job_edit.setText(str(candidates[0]))
-
-        self._recompute_auto_radius()
-        self._recompute_estimate()
-
-    def _auto_fill_from_job(self, job_dir: str) -> None:
-        # try infer placed STL from sjb
-        if not self.stl_edit.text().strip():
-            p = infer_stl_path_from_job(job_dir)
-            if p is not None:
-                self.stl_edit.setText(str(p))
+            self.out_edit.setText(str(Path(job_dir) / "slice2solid_out"))
+        # Reset preview toolpath cache when switching jobs.
+        try:
+            self._preview_sim_path = str(infer_simulation_txt_from_job(job_dir) or "")
+        except Exception:
+            self._preview_sim_path = None
+        try:
+            self._preview_toolpath_cache.clear()
+            self._preview_toolpath_last_key = None
+        except Exception:
+            pass
         self._recompute_auto_radius()
         self._recompute_estimate()
 
@@ -3402,7 +5163,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         job_dir = self.job_edit.text().strip()
-        sim_path = self.sim_edit.text().strip()
         if not job_dir:
             self.radius_hint.setText("Авто: неизвестно (выберите папку ssys_*)")
             return
@@ -3412,15 +5172,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             header = None
-            if sim_path and Path(sim_path).exists():
-                header, _it = read_simulation_export(sim_path)
+            sim_path = infer_simulation_txt_from_job(job_dir)
+            if sim_path is not None and sim_path.exists():
+                header, _it = read_simulation_export(str(sim_path))
             params = load_job_params(job_dir)
             bead_w = estimate_bead_width_mm(params, sim_slice_height_mm=header.slice_height_mm if header else None)
             if bead_w is None:
                 self.radius_hint.setText("Авто: не удалось определить ширину дорожки")
                 return
             r = bead_w / 2.0
-            self.radius_hint.setText(f"Авто: ширина≈{bead_w:.3f} мм → радиус≈{r:.3f} мм")
+            self.radius_hint.setText(f"Авто: ширина {bead_w:.3f} мм, радиус {r:.3f} мм")
         except Exception as e:
             self.radius_hint.setText(f"Авто: ошибка ({e})")
 
@@ -3428,41 +5189,95 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "export_geometry") and not self.export_geometry.isChecked():
             self.estimate.setText("Оценка: геометрия отключена (только ANSYS/CAE).")
             return
-        stl_path = self.stl_edit.text().strip()
-        if not stl_path or not Path(stl_path).exists():
-            self.estimate.setText("Оценка: выберите Placed STL, чтобы посчитать габариты/сетку.")
+        job_dir = self.job_edit.text().strip()
+        if not job_dir or not Path(job_dir).exists():
+            self.estimate.setText("Оценка: выберите папку ssys_*, чтобы посчитать габариты/сетку.")
+            return
+        stl_path = infer_stl_from_job_folder(job_dir)
+        if stl_path is None or not stl_path.exists():
+            self.estimate.setText(
+                "Оценка: STL не найден в папке ssys_*.\n"
+                "В Insight включите сохранение копии STL в папку задания (Save STL copy / Save STL in job folder) "
+                "или скопируйте STL в эту папку вручную."
+            )
             return
         try:
-            mesh = trimesh.load_mesh(stl_path, force="mesh")
+            mesh = trimesh.load_mesh(str(stl_path), force="mesh")
             bmin = mesh.bounds[0]
             bmax = mesh.bounds[1]
             v = float(self.voxel_size.value())
             size = bmax - bmin
             nx, ny, nz = (int(np.ceil(s / v)) + 1 for s in size)
             voxels = nx * ny * nz
-            approx_mb = voxels / (1024 * 1024)  # bool ~1 byte worst-case
+            occ_mb = float(voxels) / (1024 * 1024)  # bool ~1 byte worst-case
+            sigma = float(self.vol_sigma.value()) if hasattr(self, "vol_sigma") else 0.0
+            ds = int(self.meshing_downsample.value()) if hasattr(self, "meshing_downsample") else 1
+
+            # Rough workload indicator (quality-first; long runtime is acceptable).
+            if voxels < 20_000_000:
+                level = "Легко"
+            elif voxels < 80_000_000:
+                level = "Средне"
+            elif voxels < 200_000_000:
+                level = "Тяжело"
+            else:
+                level = "Очень тяжело"
+
+            extra = ""
+            if sigma > 0:
+                # Conservative estimate: float32 volume copies during smoothing/meshing.
+                vol_gb = (float(voxels) * 4.0 * 3.0) / float(1024**3)
+                extra = f"\nСглаживание объёма: может потребоваться временно до ~{vol_gb:.1f} GB (RAM/диск)."
+
             self.estimate.setText(
-                f"bbox≈{size[0]:.1f}×{size[1]:.1f}×{size[2]:.1f} мм; сетка≈{nx}×{ny}×{nz} ({voxels:,} вокселей), "
-                f"память грубо ~{approx_mb:.1f} MB (+ оверхед)."
+                "Оценка нагрузки:\n"
+                f" - Габариты STL: {size[0]:.1f} x {size[1]:.1f} x {size[2]:.1f} мм\n"
+                f" - Воксельная сетка: {nx} x {ny} x {nz} (примерно {voxels:,} ячеек)\n"
+                f" - Память под объём (минимум): ~{occ_mb:.0f} MB\n"
+                f" - Построение поверхности: downsample={ds}, sigma={sigma:.2f}\n"
+                f" - Итог: {level}{extra}"
             )
         except Exception as e:
             self.estimate.setText(f"Оценка: ошибка чтения STL ({e})")
 
     def _run(self) -> None:
-        sim = self.sim_edit.text().strip()
         job_dir = self.job_edit.text().strip() or None
-        stl = self.stl_edit.text().strip()
         out = self.out_edit.text().strip()
         do_geo = bool(self.export_geometry.isChecked())
         do_bundle = bool(self.export_bundle.isChecked()) and do_geo
         do_cae = bool(self.export_cae.isChecked())
-        if not sim or not out or (do_geo and not stl):
+
+        if not job_dir:
+            QtWidgets.QMessageBox.warning(self, "Не хватает данных", "Выберите папку после слайсинга (ssys_*).")
+            return
+
+        sim_path = infer_simulation_txt_from_job(job_dir)
+        if sim_path is None or not sim_path.exists():
             QtWidgets.QMessageBox.warning(
                 self,
-                "Missing input",
-                "Please select simulation export and output folder. Placed STL is required for geometry export.",
+                "Не найден simulation-data.txt",
+                "В папке ssys_* не найден `*-simulation-data.txt`.\n"
+                "Сделайте в Insight: Toolpaths -> Simulation data export, затем повторите.",
             )
             return
+
+        stl_path = infer_stl_from_job_folder(job_dir)
+        if do_geo and (stl_path is None or not stl_path.exists()):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Не найден STL",
+                "Для восстановления геометрии нужен STL в папке ssys_*.\n\n"
+                "Что сделать:\n"
+                "1) В Insight включите сохранение копии STL в папку задания (Save STL copy / Save STL in job folder), или\n"
+                "2) Скопируйте исходный STL в папку ssys_* вручную.\n\n"
+                "Иначе выключите 'Сгенерировать STL (предпросмотр)' и запустите только ANSYS/CAE экспорт.",
+            )
+            return
+
+        if not out:
+            out = str(Path(job_dir) / "slice2solid_out")
+            self.out_edit.setText(out)
+
         if not do_geo and not do_cae:
             QtWidgets.QMessageBox.warning(self, "Нечего делать", "Включите выходную геометрию и/или экспорт для ANSYS.")
             return
@@ -3471,7 +5286,22 @@ class MainWindow(QtWidgets.QMainWindow):
         max_jump: float | None
         header = None
         if self.jump_filter.isChecked() or (do_geo and self.auto_radius.isChecked()):
-            header, _it = read_simulation_export(sim)
+            header, _it = read_simulation_export(str(sim_path))
+
+        # For slicer-like preview overlay.
+        try:
+            self._preview_sim_path = str(sim_path)
+        except Exception:
+            self._preview_sim_path = None
+        try:
+            self._preview_slice_height_mm = float(header.slice_height_mm) if header is not None and header.slice_height_mm else None
+        except Exception:
+            self._preview_slice_height_mm = None
+        try:
+            self._preview_toolpath_cache.clear()
+            self._preview_toolpath_last_key = None
+        except Exception:
+            pass
 
         params = None
         bead_w: float | None = None
@@ -3525,10 +5355,16 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             max_jump = None
 
+        # Cache for preview overlay (toolpath lines).
+        try:
+            self._last_max_jump_mm = float(max_jump) if max_jump is not None else None
+        except Exception:
+            self._last_max_jump_mm = None
+
         cfg = JobConfig(
-            simulation_txt=sim,
+            simulation_txt=str(sim_path),
             job_dir=job_dir,
-            placed_stl=stl,
+            placed_stl=str(stl_path) if stl_path is not None else "",
             output_dir=out,
             voxel_size_mm=float(self.voxel_size.value()),
             max_radius_mm=max_r,
@@ -3555,10 +5391,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.progress.setValue(0)
         self.log_box.clear()
-        self._append_log("Starting…")
+        self._append_log("Запуск...")
         self.open_out_btn.setEnabled(False)
         try:
-            self.mesh_preview.set_meshes(None, None, {})
+            self.mesh_preview.set_mesh(None, stats={}, key="after")
         except Exception:
             pass
 
@@ -3578,10 +5414,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thread.start()
 
     def _update_preview(self, before: object, after: object, stats: object) -> None:
+        # Keep last preview mesh for the Preview tab (single-view).
         try:
-            self.mesh_preview.set_meshes(before, after, stats if isinstance(stats, dict) else {})
+            if isinstance(after, trimesh.Trimesh):
+                self._preview_last_after = after
+                self._preview_last_stats = stats if isinstance(stats, dict) else {}
+                try:
+                    bb = np.asarray(after.bounds, dtype=float)
+                    self._preview_zmin = float(bb[0, 2])
+                    self._preview_zmax = float(bb[1, 2])
+                except Exception:
+                    self._preview_zmin = None
+                    self._preview_zmax = None
         except Exception:
             pass
+        try:
+            self.mesh_preview.set_mesh(after if isinstance(after, trimesh.Trimesh) else None, stats=stats if isinstance(stats, dict) else {}, key="after")
+        except Exception:
+            pass
+        self._apply_preview_slice()
 
     def _done(self, ok: bool, message: str, outputs: object) -> None:
         self.run_btn.setEnabled(True)
@@ -3640,6 +5491,7 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
 
     app = QtWidgets.QApplication(sys.argv)
+    _apply_app_style(app)
     try:
         app.setOrganizationName(ORGANIZATION or "slice2solid")
         app.setApplicationName(APP_DISPLAY_NAME or "slice2solid")
@@ -3653,7 +5505,71 @@ def main(argv: list[str] | None = None) -> int:
             settings.sync()
         except Exception:
             pass
+    splash: QtWidgets.QSplashScreen | None = None
+    timer = QtCore.QElapsedTimer()
+    try:
+        timer.start()
+        splash = QtWidgets.QSplashScreen(_create_splash_pixmap())
+        splash.setWindowIcon(_load_app_icon())
+        splash.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
+        try:
+            splash.setWindowOpacity(0.0)
+        except Exception:
+            pass
+        splash.show()
+        splash.showMessage(
+            "Загрузка...",
+            QtCore.Qt.AlignmentFlag.AlignBottom | QtCore.Qt.AlignmentFlag.AlignHCenter,
+            QtGui.QColor(255, 255, 255, 200),
+        )
+        try:
+            anim_in = QtCore.QPropertyAnimation(splash, b"windowOpacity")
+            anim_in.setDuration(550)
+            anim_in.setStartValue(0.0)
+            anim_in.setEndValue(1.0)
+            anim_in.start(QtCore.QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+            setattr(splash, "_s2s_anim_in", anim_in)
+        except Exception:
+            pass
+        app.processEvents()
+    except Exception:
+        splash = None
+
     w = MainWindow()
+
+    if splash is not None:
+        try:
+            try:
+                min_ms = int(os.environ.get("S2S_SPLASH_MS", "6000"))
+            except Exception:
+                min_ms = 6000
+            elapsed = int(timer.elapsed()) if timer.isValid() else min_ms
+            remaining = max(0, int(min_ms - elapsed))
+            if remaining > 0:
+                loop = QtCore.QEventLoop()
+                QtCore.QTimer.singleShot(remaining, loop.quit)
+                loop.exec()
+        except Exception:
+            pass
+
+        # Fade-out splash BEFORE showing the main window (prevents the splash from "hanging" on top).
+        try:
+            anim_out = QtCore.QPropertyAnimation(splash, b"windowOpacity")
+            anim_out.setDuration(550)
+            anim_out.setStartValue(1.0)
+            anim_out.setEndValue(0.0)
+            anim_out.finished.connect(splash.close)
+            anim_out.start(QtCore.QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+
+            loop = QtCore.QEventLoop()
+            anim_out.finished.connect(loop.quit)
+            loop.exec()
+        except Exception:
+            try:
+                splash.close()
+            except Exception:
+                pass
+
     w.show()
     try:
         app.processEvents()

@@ -38,12 +38,13 @@ def compute_layer_orientations(
     *,
     slice_height_mm: float,
     z0_mm: float | None = None,
+    layer_axis_xyz: tuple[float, float, float] = (0.0, 0.0, 1.0),
     max_jump_mm: float | None = None,
-    min_xy_segment_mm: float = 1e-3,
+    min_inplane_segment_mm: float = 1e-3,
     weights: np.ndarray | None = None,
 ) -> list[LayerOrientation]:
     """
-    Compute a dominant toolpath direction per layer.
+    Compute a dominant toolpath direction per layer (in-plane, i.e. perpendicular to layer axis).
 
     Uses XY-projected segment directions and 180°-symmetric averaging via doubled angles:
         mean(theta) = 0.5 * atan2(sum(w*sin(2θ)), sum(w*cos(2θ)))
@@ -53,7 +54,7 @@ def compute_layer_orientations(
         slice_height_mm: slice height (mm).
         z0_mm: Z origin for layer indexing. Defaults to min(Z).
         max_jump_mm: if provided, segments longer than this are treated as travel jumps and ignored.
-        min_xy_segment_mm: ignore near-vertical / tiny XY segments when computing in-plane direction.
+        min_inplane_segment_mm: ignore near-axis / tiny in-plane segments when computing in-plane direction.
         weights: optional (N,) weights per point to apply to segment (uses average of endpoints).
     """
     if xyz.ndim != 2 or xyz.shape[1] != 3:
@@ -63,7 +64,33 @@ def compute_layer_orientations(
     if xyz.shape[0] < 2:
         return []
 
-    z0 = float(np.min(xyz[:, 2])) if z0_mm is None else float(z0_mm)
+    ax = np.array(layer_axis_xyz, dtype=float)
+    n = float(np.linalg.norm(ax))
+    if not np.isfinite(n) or n <= 1e-12:
+        raise ValueError("layer_axis_xyz must be non-zero")
+    ax = ax / n
+
+    # In-plane orthonormal basis (u, v) where:
+    # - u is the projection of global X onto the layer plane (or global Y if X is near-parallel to axis)
+    # - v completes a right-handed system: v = ax x u
+    ref = np.array([1.0, 0.0, 0.0], dtype=float)
+    u = ref - ax * float(np.dot(ax, ref))
+    un = float(np.linalg.norm(u))
+    if un <= 1e-9 or not np.isfinite(un):
+        ref = np.array([0.0, 1.0, 0.0], dtype=float)
+        u = ref - ax * float(np.dot(ax, ref))
+        un = float(np.linalg.norm(u))
+    if un <= 1e-12 or not np.isfinite(un):
+        raise ValueError("layer_axis_xyz is degenerate for basis construction")
+    u = u / un
+    v = np.cross(ax, u)
+    vn = float(np.linalg.norm(v))
+    if vn <= 1e-12 or not np.isfinite(vn):
+        raise ValueError("layer_axis_xyz is degenerate for basis construction")
+    v = v / vn
+
+    coords = xyz @ ax
+    z0 = float(np.min(coords)) if z0_mm is None else float(z0_mm)
     max_jump = float(max_jump_mm) if max_jump_mm is not None else None
 
     # per layer accumulators
@@ -82,20 +109,23 @@ def compute_layer_orientations(
         if max_jump is not None and seg_len > max_jump:
             continue
 
-        vx, vy = float(seg[0]), float(seg[1])
-        len_xy = math.hypot(vx, vy)
-        if len_xy < float(min_xy_segment_mm):
+        # Project segment onto layer plane.
+        seg_plane = seg - ax * float(np.dot(seg, ax))
+        sx = float(np.dot(seg_plane, u))
+        sy = float(np.dot(seg_plane, v))
+        len_inplane = math.hypot(sx, sy)
+        if len_inplane < float(min_inplane_segment_mm):
             continue
 
-        # layer index by segment midpoint Z
-        z_mid = float(0.5 * (a[2] + b[2]))
+        # layer index by segment midpoint along the layer axis
+        z_mid = float(0.5 * ((a @ ax) + (b @ ax)))
         layer_id = int(round((z_mid - z0) / float(slice_height_mm)))
 
-        theta = math.atan2(vy, vx)
+        theta = math.atan2(sy, sx)
         c2 = math.cos(2.0 * theta)
         s2 = math.sin(2.0 * theta)
 
-        w = len_xy
+        w = len_inplane
         if weights is not None:
             w_pt = float(0.5 * (weights[i - 1] + weights[i]))
             if w_pt > 0:
@@ -123,7 +153,14 @@ def compute_layer_orientations(
             theta = 0.5 * math.atan2(s, c)
             theta = _wrap_pi(theta)
             angle = math.degrees(theta)
-            dir_xyz = (math.cos(theta), math.sin(theta), 0.0)
+            d = u * math.cos(theta) + v * math.sin(theta)
+            dn = float(np.linalg.norm(d))
+            if dn <= 1e-12 or not np.isfinite(dn):
+                angle = None
+                dir_xyz = None
+            else:
+                d = d / dn
+                dir_xyz = (float(d[0]), float(d[1]), float(d[2]))
 
         z_min = z0 + layer_id * float(slice_height_mm)
         z_max = z0 + (layer_id + 1) * float(slice_height_mm)
@@ -151,8 +188,9 @@ def compute_layer_orientations_toolpath(
     *,
     slice_height_mm: float,
     z0_mm: float,
+    layer_axis_xyz: tuple[float, float, float] = (0.0, 0.0, 1.0),
     max_jump_mm: float | None = None,
-    min_xy_segment_mm: float = 1e-3,
+    min_inplane_segment_mm: float = 1e-3,
     type_filter: int = 1,
     weight_by_bead_area: bool = True,
     ignore_zero_factor: bool = True,
@@ -168,15 +206,36 @@ def compute_layer_orientations_toolpath(
         slice_height_mm: slice height (mm).
         z0_mm: Z origin for layer indexing (typically min Z of Type=1 points).
         max_jump_mm: if provided, segments longer than this are treated as travel jumps and ignored.
-        min_xy_segment_mm: ignore near-vertical / tiny XY segments when computing in-plane direction.
+        min_inplane_segment_mm: ignore near-axis / tiny in-plane segments when computing in-plane direction.
         type_filter: toolpath point Type to use (default: 1 = model).
         weight_by_bead_area: if True, weights segments by avg bead_area of endpoints.
     """
     if slice_height_mm <= 0:
         raise ValueError("slice_height_mm must be > 0")
 
+    ax = np.array(layer_axis_xyz, dtype=float)
+    n = float(np.linalg.norm(ax))
+    if not np.isfinite(n) or n <= 1e-12:
+        raise ValueError("layer_axis_xyz must be non-zero")
+    ax = ax / n
     z0 = float(z0_mm)
     max_jump = float(max_jump_mm) if max_jump_mm is not None else None
+
+    ref = np.array([1.0, 0.0, 0.0], dtype=float)
+    u = ref - ax * float(np.dot(ax, ref))
+    un = float(np.linalg.norm(u))
+    if un <= 1e-9 or not np.isfinite(un):
+        ref = np.array([0.0, 1.0, 0.0], dtype=float)
+        u = ref - ax * float(np.dot(ax, ref))
+        un = float(np.linalg.norm(u))
+    if un <= 1e-12 or not np.isfinite(un):
+        raise ValueError("layer_axis_xyz is degenerate for basis construction")
+    u = u / un
+    v = np.cross(ax, u)
+    vn = float(np.linalg.norm(v))
+    if vn <= 1e-12 or not np.isfinite(vn):
+        raise ValueError("layer_axis_xyz is degenerate for basis construction")
+    v = v / vn
 
     sum_c = defaultdict(float)
     sum_s = defaultdict(float)
@@ -198,11 +257,11 @@ def compute_layer_orientations_toolpath(
             prev = pt
             continue
 
-        ax, ay, az = float(prev.x), float(prev.y), float(prev.z)
-        bx, by, bz = float(pt.x), float(pt.y), float(pt.z)
-        dx = bx - ax
-        dy = by - ay
-        dz = bz - az
+        prev_x, prev_y, prev_z = float(prev.x), float(prev.y), float(prev.z)
+        curr_x, curr_y, curr_z = float(pt.x), float(pt.y), float(pt.z)
+        dx = curr_x - prev_x
+        dy = curr_y - prev_y
+        dz = curr_z - prev_z
         seg_len = math.sqrt(dx * dx + dy * dy + dz * dz)
         if seg_len <= 1e-12:
             prev = pt
@@ -211,19 +270,28 @@ def compute_layer_orientations_toolpath(
             prev = pt
             continue
 
-        len_xy = math.hypot(dx, dy)
-        if len_xy < float(min_xy_segment_mm):
+        # Project segment onto layer plane (perpendicular to axis) and measure its in-plane length.
+        seg_dot = float(ax[0] * dx + ax[1] * dy + ax[2] * dz)
+        px = float(dx - seg_dot * float(ax[0]))
+        py = float(dy - seg_dot * float(ax[1]))
+        pz = float(dz - seg_dot * float(ax[2]))
+        sx = float(u[0] * px + u[1] * py + u[2] * pz)
+        sy = float(v[0] * px + v[1] * py + v[2] * pz)
+        len_inplane = math.hypot(sx, sy)
+        if len_inplane < float(min_inplane_segment_mm):
             prev = pt
             continue
 
-        z_mid = 0.5 * (az + bz)
+        z_prev = float(ax[0] * prev_x + ax[1] * prev_y + ax[2] * prev_z)
+        z_curr = float(ax[0] * curr_x + ax[1] * curr_y + ax[2] * curr_z)
+        z_mid = 0.5 * (z_prev + z_curr)
         layer_id = int(round((z_mid - z0) / float(slice_height_mm)))
 
-        theta = math.atan2(dy, dx)
+        theta = math.atan2(sy, sx)
         c2 = math.cos(2.0 * theta)
         s2 = math.sin(2.0 * theta)
 
-        w = float(len_xy)
+        w = float(len_inplane)
         if weight_by_bead_area:
             w_area = 0.5 * (float(prev.bead_area) + float(pt.bead_area))
             if w_area > 0:
@@ -253,7 +321,14 @@ def compute_layer_orientations_toolpath(
             theta = 0.5 * math.atan2(s, c)
             theta = _wrap_pi(theta)
             angle = math.degrees(theta)
-            dir_xyz = (math.cos(theta), math.sin(theta), 0.0)
+            d = u * math.cos(theta) + v * math.sin(theta)
+            dn = float(np.linalg.norm(d))
+            if dn <= 1e-12 or not np.isfinite(dn):
+                angle = None
+                dir_xyz = None
+            else:
+                d = d / dn
+                dir_xyz = (float(d[0]), float(d[1]), float(d[2]))
 
         z_min = z0 + layer_id * float(slice_height_mm)
         z_max = z0 + (layer_id + 1) * float(slice_height_mm)
