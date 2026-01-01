@@ -59,7 +59,7 @@ slice2solid восстанавливает представление FDM-дет
 Инструмент поддерживает два режима, использующих одни и те же входные данные:
 
 ### 1) CAE-представление (основной режим)
- - гладкая замкнутая геометрия на основе `placed STL` (STL после размещения в Insight);
+- гладкая замкнутая внешняя геометрия детали (CAD-solid или STL), без явного инфилла;
 - учёт структуры печати через анизотропные свойства и ориентации по траекториям;
 - экспорт данных ориентаций/слоёв для ANSYS Mechanical.
 
@@ -95,9 +95,10 @@ slice2solid позволяет:
 ## Быстрый старт (Python)
 
 Требования:
-- Windows (из-за Stratasys Insight; код проекта — Python);
+- Windows (из-за Stratasys Insight; код проекта - Python);
 - Python 3.11+;
-- данные из Stratasys Insight: `*-simulation-data.txt` и `placed STL`;
+- данные из Stratasys Insight: `*-simulation-data.txt` (Toolpaths -> Simulation data export);
+- (для экспорта геометрии в CAD) STL детали в папке `ssys_*` (Save STL copy in job folder) или вручную скопированный туда;
 - (опционально) ANSYS Mechanical для импорта ориентаций/слоёв.
 
 Установка (из корня репозитория):
@@ -126,9 +127,9 @@ CLI-утилита (на данный момент - standalone Mesh Healer):
 1. Спроектировать монолитное тело в CAD
 2. Экспортировать STL из CAD
 3. Импортировать STL в Stratasys Insight
-4. Ориентировать деталь и сохранить `placed STL`
-5. Выполнить slicing
-6. Экспортировать симуляцию траекторий: `*-simulation-data.txt`
+4. Ориентировать/разместить деталь в Insight и выполнить slicing
+5. Экспортировать симуляцию траекторий: `*-simulation-data.txt` (Toolpaths -> Simulation data export)
+6. (Для экспорта геометрии в CAD) сохранить копию STL в папку задания `ssys_*` (Save STL copy in job folder)
 7. Запустить `slice2solid` для получения:
    - CAE-ориентированного представления и ориентаций траекторий
    - (опционально) геометрии внутренней структуры в виде сетки (mesh)
@@ -138,9 +139,11 @@ CLI-утилита (на данный момент - standalone Mesh Healer):
 
 ## Входные данные (Inputs)
 
-Минимально необходимо:
-- текстовый экспорт симуляции траекторий из Insight: `*-simulation-data.txt` (с блоком заголовка `Toolpath Simulation Data`, матрицей `STL to CMB transformation matrix` и таблицей траекторий);
-- копия исходной геометрии `*.stl` в папке задания `ssys_*` (в Insight включите сохранение STL в папку задания / Save STL copy in job folder).
+Для экспорта CAE (ANSYS / карта ориентации по слоям) необходимо:
+- текстовый экспорт симуляции траекторий из Insight: `*-simulation-data.txt` (с блоком заголовка `Toolpath Simulation Data`, матрицей `STL to CMB transformation matrix` и таблицей траекторий).
+
+Для экспорта геометрии в CAD дополнительно нужно:
+- STL детали в папке задания `ssys_*` (в Insight включите сохранение копии STL в папку задания / Save STL copy in job folder, или скопируйте STL туда вручную).
 
 Опционально (рекомендуется для авто-параметров/метаданных):
 - папка задания Insight `ssys_*` с `sliceParams.*`, `toolpathParams.*`, `supportParams.*` и др.
