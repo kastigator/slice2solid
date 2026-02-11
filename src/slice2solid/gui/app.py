@@ -137,6 +137,14 @@ def infer_stl_from_job_folder(job_dir: str | Path) -> Path | None:
     return infer_stl_path_from_job(root)
 
 
+def has_toolpath_params(job_dir: str | Path) -> bool:
+    root = Path(job_dir)
+    try:
+        return (root / "toolpathParams.new").exists() or (root / "toolpathParams.cur").exists()
+    except Exception:
+        return False
+
+
 def extract_toolpath_segments_for_layer(
     simulation_txt: str | Path,
     *,
@@ -3383,7 +3391,7 @@ _HELP_HTML = """
 <h3>1) Что выбрать в Insight</h3>
 <ol>
   <li><b>Папка после слайсинга (ssys_*)</b>: папка задания Insight. Внутри должны быть <code>*-simulation-data.txt</code>, <code>toolpathParams.*</code> и (для геометрии) <code>*.stl</code>.</li>
-  <li><b>Результат</b>: по умолчанию пишется в <code>&lt;ssys_*&gt;/slice2solid_out</code> (другую папку можно выбрать в разделе «Дополнительно»).</li>
+  <li><b>Результат</b>: пишется в <code>&lt;ssys_*&gt;/slice2solid_out</code> (папка создаётся автоматически).</li>
 </ol>
 
 <h3>2) Вкладка “CAD / Геометрия”</h3>
@@ -3658,7 +3666,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "- `*-simulation-data.txt` (Insight: Toolpaths -> Simulation data export)\n"
             "- `*.stl` (копия исходной геометрии)\n"
             "- `toolpathParams.*` (для авто-радиуса дорожки)\n\n"
-            "В GUI достаточно выбрать только эту папку."
+            "Дальше программа сама создаст `<ssys_*>/slice2solid_out` и запишет результаты туда."
         )
         self.job_btn = QtWidgets.QPushButton("Обзор...")
         job_row = QtWidgets.QHBoxLayout()
@@ -3666,36 +3674,18 @@ class MainWindow(QtWidgets.QMainWindow):
         job_row.addWidget(self.job_btn)
         io_form.addRow("Папка после слайсинга (ssys_*):", job_row)
 
-        # Advanced: output folder override (default: <ssys_*>/slice2solid_out).
-        self.advanced_toggle = QtWidgets.QToolButton()
-        self.advanced_toggle.setText("Дополнительно")
-        self.advanced_toggle.setCheckable(True)
-        self.advanced_toggle.setChecked(False)
-        self.advanced_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.advanced_toggle.setArrowType(QtCore.Qt.ArrowType.RightArrow)
-        io_form.addRow("", self.advanced_toggle)
-
-        self.advanced_panel = QtWidgets.QWidget()
-        adv_form = QtWidgets.QFormLayout(self.advanced_panel)
-        adv_form.setContentsMargins(0, 0, 0, 0)
-
         self.out_edit = QtWidgets.QLineEdit()
-        self.out_edit.setPlaceholderText(r"По умолчанию: <ssys_*>\\slice2solid_out")
+        self.out_edit.setReadOnly(True)
+        self.out_edit.setPlaceholderText(r"Автоматически: <ssys_*>\\slice2solid_out")
         _set_help(
             self.out_edit,
             title="Папка результата",
-            body="Папка, куда программа запишет результаты. Если оставить пусто, используется `<ssys_*>/slice2solid_out`.",
-            pros="Можно запускать несколько раз в разные папки и сравнивать параметры.",
+            body="Результаты автоматически пишутся в `<ssys_*>/slice2solid_out` (папка создаётся при запуске).",
+            pros="Не нужно выбирать выходную папку — меньше шансов перепутать.",
             cons="Большие STL могут занимать много места.",
-            tip="Обычно не трогают. Для экспериментов можно указать отдельную папку (например, out_0p10_sigma1).",
+            tip="Если нужно разделять эксперименты — используйте разные папки ssys_* (или копии).",
         )
-        self.out_btn = QtWidgets.QPushButton("Обзор...")
-        out_row = QtWidgets.QHBoxLayout()
-        out_row.addWidget(self.out_edit, 1)
-        out_row.addWidget(self.out_btn)
-        adv_form.addRow("Папка результата (override):", out_row)
-        self.advanced_panel.setVisible(False)
-        io_form.addRow("", self.advanced_panel)
+        io_form.addRow("Папка результата:", self.out_edit)
 
         tabs = QtWidgets.QTabWidget()
         self.main_tabs = tabs
@@ -4318,13 +4308,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_last_stats: dict | None = None
 
         self.job_btn.clicked.connect(self._pick_job)
-        self.out_btn.clicked.connect(self._pick_out)
-        self.advanced_toggle.toggled.connect(self._on_advanced_toggled)
         self.geo_advanced_toggle.toggled.connect(self._on_geo_advanced_toggled)
         self.run_btn.clicked.connect(self._run)
         self.bottom_toggle_btn.toggled.connect(self._on_bottom_toggle)
         self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
         self.auto_radius.toggled.connect(self._update_radius_widgets)
+        self.job_edit.textChanged.connect(self._sync_output_dir_from_job)
+        self.job_edit.editingFinished.connect(lambda: self._load_last_run_from_output_dir(load_meshes=False))
         self.job_edit.textChanged.connect(self._recompute_auto_radius)
         self.job_edit.textChanged.connect(self._recompute_estimate)
         self.voxel_size.valueChanged.connect(self._recompute_estimate)
@@ -4347,7 +4337,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ansys_preset_combo.currentIndexChanged.connect(self._on_ansys_preset_selection_changed)
         self.preview_open_folder_btn.clicked.connect(self._open_output_folder)
         self.preview_reload_btn.clicked.connect(lambda: self._load_last_run_from_output_dir(load_meshes=True))
-        self.out_edit.editingFinished.connect(lambda: self._load_last_run_from_output_dir(load_meshes=False))
         self.preview_slice_cb.toggled.connect(self._on_preview_slice_toggled)
         self.preview_slice_slider.valueChanged.connect(self._on_preview_slice_changed)
         self.preview_slice_snap_cb.toggled.connect(self._on_preview_slice_changed)
@@ -4420,7 +4409,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._settings.setValue("window/geometry", self.saveGeometry())
             self._settings.setValue("window/state", self.saveState())
             self._settings.setValue("paths/job", self.job_edit.text().strip())
-            self._settings.setValue("paths/out", self.out_edit.text().strip())
+            # Output path is derived from the selected job folder.
+            try:
+                self._settings.remove("paths/out")
+            except Exception:
+                pass
         except Exception:
             pass
         super().closeEvent(event)
@@ -4435,14 +4428,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.restoreState(state)
 
             job = self._settings.value("paths/job", "", type=str) or ""
-            out = self._settings.value("paths/out", "", type=str) or ""
 
             if job and not self.job_edit.text().strip():
                 self.job_edit.setText(job)
-            if out and not self.out_edit.text().strip():
-                self.out_edit.setText(out)
         except Exception:
             return
+        self._sync_output_dir_from_job()
         self._load_last_run_from_output_dir(load_meshes=False)
 
     # Preview backend switching removed: keep a single CMB-oriented preview (Auto => prefer VTK).
@@ -4973,21 +4964,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.job_edit.setText(path)
             self._auto_fill_from_job(path)
 
-    def _pick_out(self) -> None:
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку результата")
-        if path:
-            self.out_edit.setText(path)
-
-    def _on_advanced_toggled(self, checked: bool) -> None:
-        try:
-            self.advanced_panel.setVisible(bool(checked))
-        except Exception:
-            pass
-        try:
-            self.advanced_toggle.setArrowType(QtCore.Qt.ArrowType.DownArrow if checked else QtCore.Qt.ArrowType.RightArrow)
-        except Exception:
-            pass
-
     def _on_geo_advanced_toggled(self, checked: bool) -> None:
         checked = bool(checked)
         try:
@@ -5094,7 +5070,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "2) Для восстановления геометрии нужен `*.stl` в этой же папке.\n"
             "   Если STL не находится: включите в Insight сохранение копии STL в папку задания (Save STL copy / Save STL in job folder)\n"
             "   или скопируйте исходный STL в папку ssys_* вручную.\n\n"
-            "3) Нажмите Запуск. По умолчанию результаты пишутся в `<ssys_*>/slice2solid_out` (override — в «Дополнительно»).\n\n"
+            "3) Нажмите Запуск. Результаты пишутся в `<ssys_*>/slice2solid_out` (папка создаётся автоматически).\n\n"
             "После запуска:\n"
             " - вкладка 'Просмотр' показывает модель (после сглаживания), сечение по Z и траекторию слоёв\n"
             " - блок 'Результаты' позволяет открыть файлы/папку и скопировать путь\n\n"
@@ -5119,9 +5095,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _auto_fill_from_job(self, job_dir: str) -> None:
-        # auto output folder
-        if not self.out_edit.text().strip():
-            self.out_edit.setText(str(Path(job_dir) / "slice2solid_out"))
+        self.out_edit.setText(str(Path(job_dir) / "slice2solid_out"))
         # Reset preview toolpath cache when switching jobs.
         try:
             self._preview_sim_path = str(infer_simulation_txt_from_job(job_dir) or "")
@@ -5134,6 +5108,19 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self._recompute_auto_radius()
         self._recompute_estimate()
+
+    def _sync_output_dir_from_job(self) -> None:
+        job_dir = self.job_edit.text().strip()
+        if not job_dir:
+            if self.out_edit.text().strip():
+                self.out_edit.setText("")
+            return
+        try:
+            out = str(Path(job_dir) / "slice2solid_out")
+        except Exception:
+            return
+        if self.out_edit.text().strip() != out:
+            self.out_edit.setText(out)
 
     def _update_radius_widgets(self) -> None:
         manual = not self.auto_radius.isChecked()
@@ -5242,44 +5229,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _run(self) -> None:
         job_dir = self.job_edit.text().strip() or None
-        out = self.out_edit.text().strip()
         do_geo = bool(self.export_geometry.isChecked())
         do_bundle = bool(self.export_bundle.isChecked()) and do_geo
         do_cae = bool(self.export_cae.isChecked())
 
+        if not do_geo and not do_cae:
+            QtWidgets.QMessageBox.warning(self, "Нечего делать", "Включите выходную геометрию и/или экспорт для ANSYS.")
+            return
+
         if not job_dir:
             QtWidgets.QMessageBox.warning(self, "Не хватает данных", "Выберите папку после слайсинга (ssys_*).")
             return
+        if not Path(job_dir).exists():
+            QtWidgets.QMessageBox.warning(self, "Папка не найдена", "Указанная папка ssys_* не существует.")
+            return
+
+        # Output folder is always derived from job_dir to avoid using a stale path.
+        out = str(Path(job_dir) / "slice2solid_out")
+        self.out_edit.setText(out)
+
+        missing: list[str] = []
 
         sim_path = infer_simulation_txt_from_job(job_dir)
         if sim_path is None or not sim_path.exists():
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Не найден simulation-data.txt",
-                "В папке ssys_* не найден `*-simulation-data.txt`.\n"
-                "Сделайте в Insight: Toolpaths -> Simulation data export, затем повторите.",
-            )
-            return
+            missing.append("`*-simulation-data.txt` (Insight: Toolpaths -> Simulation data export)")
 
         stl_path = infer_stl_from_job_folder(job_dir)
         if do_geo and (stl_path is None or not stl_path.exists()):
+            missing.append("`*.stl` (копия STL в папке ssys_*)")
+
+        if do_geo and self.auto_radius.isChecked() and not has_toolpath_params(job_dir):
+            missing.append("`toolpathParams.new` или `toolpathParams.cur` (для авто-радиуса)")
+
+        if missing:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Не найден STL",
-                "Для восстановления геометрии нужен STL в папке ssys_*.\n\n"
-                "Что сделать:\n"
-                "1) В Insight включите сохранение копии STL в папку задания (Save STL copy / Save STL in job folder), или\n"
-                "2) Скопируйте исходный STL в папку ssys_* вручную.\n\n"
-                "Иначе выключите 'Сгенерировать STL (предпросмотр)' и запустите только ANSYS/CAE экспорт.",
+                "Не хватает файлов в папке ssys_*",
+                "В выбранной папке не хватает файлов:\n- " + "\n- ".join(missing),
             )
-            return
-
-        if not out:
-            out = str(Path(job_dir) / "slice2solid_out")
-            self.out_edit.setText(out)
-
-        if not do_geo and not do_cae:
-            QtWidgets.QMessageBox.warning(self, "Нечего делать", "Включите выходную геометрию и/или экспорт для ANSYS.")
             return
 
         max_r: float | None
@@ -5309,18 +5296,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if do_geo:
             if self.auto_radius.isChecked():
-                if not job_dir:
-                    QtWidgets.QMessageBox.warning(
-                        self, "Missing job folder", "Auto radius requires selecting the ssys_* folder (toolpathParams)."
-                    )
-                    return
                 params = load_job_params(job_dir)
                 bead_w = estimate_bead_width_mm(params, sim_slice_height_mm=header.slice_height_mm if header else None)
                 if bead_w is None:
                     QtWidgets.QMessageBox.warning(
                         self,
-                        "Auto radius failed",
-                        "Could not infer bead width from slicer params. Set radius manually or check job folder.",
+                        "Авто-радиус не сработал",
+                        "Не удалось вычислить ширину дорожки из `toolpathParams.*`.\n"
+                        "Отключите авто-радиус и задайте радиус вручную, либо проверьте содержимое папки ssys_*.",
                     )
                     return
                 max_r = bead_w / 2.0
